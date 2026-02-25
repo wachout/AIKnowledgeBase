@@ -1,0 +1,267 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --radius: 0.5rem;
+    --sidebar-background: 0 0% 98%;
+    --sidebar-foreground: 240 5.3% 26.1%;
+    --sidebar-primary: 240 5.9% 10%;
+    --sidebar-primary-foreground: 0 0% 98%;
+    --sidebar-accent: 240 4.8% 95.9%;
+    --sidebar-accent-foreground: 240 5.9% 10%;
+    --sidebar-border: 220 13% 91%;
+    --sidebar-ring: 217.2 91.2% 59.8%;
+    
+    /* 科技感暗色主题 CSS 变量 */
+    --cyber-bg: #0a0e17;
+    --cyber-surface: #111827;
+    --cyber-surface-light: #1f2937;
+    --cyber-border: #374151;
+    --cyber-text: #e5e7eb;
+    --cyber-text-muted: #9ca3af;
+    --cyber-accent: #00d4ff;
+    --cyber-accent-purple: #a855f7;
+    --cyber-accent-green: #22c55e;
+    --cyber-glow: rgba(0, 212, 255, 0.3);
+  }
+}
+
+/* 全局暗色背景 */
+body {
+  background: var(--cyber-bg);
+  color: var(--cyber-text);
+}
+
+img {
+  object-position: top;
+}
+
+.fixed {
+  position: fixed;
+}
+
+/* 科技感按钮样式 */
+.cyber-btn {
+  background: linear-gradient(135deg, var(--cyber-accent) 0%, var(--cyber-accent-purple) 100%);
+  border: none;
+  border-radius: 0.5rem;
+  padding: 0.75rem 1.5rem;
+  color: white;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.3s ease;
+  position: relative;
+  overflow: hidden;
+}
+
+.cyber-btn::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: -100%;
+  width: 100%;
+  height: 100%;
+  background: linear-gradient(90deg, transparent, rgba(255,255,255,0.2), transparent);
+  transition: left 0.5s ease;
+}
+
+.cyber-btn:hover::before {
+  left: 100%;
+}
+
+.cyber-btn:hover {
+  box-shadow: 0 0 30px var(--cyber-glow);
+  transform: translateY(-2px);
+}
+
+/* 科技感输入框 */
+.cyber-input {
+  background: var(--cyber-surface);
+  border: 1px solid var(--cyber-border);
+  border-radius: 0.5rem;
+  padding: 0.75rem 1rem;
+  color: var(--cyber-text);
+  transition: all 0.3s ease;
+}
+
+.cyber-input:focus {
+  outline: none;
+  border-color: var(--cyber-accent);
+  box-shadow: 0 0 20px var(--cyber-glow);
+}
+
+.cyber-input::placeholder {
+  color: var(--cyber-text-muted);
+}
+
+/* 科技感卡片 */
+.cyber-card {
+  background: var(--cyber-surface);
+  border: 1px solid var(--cyber-border);
+  border-radius: 0.75rem;
+  transition: all 0.3s ease;
+}
+
+.cyber-card:hover {
+  border-color: var(--cyber-accent);
+  box-shadow: 0 0 20px var(--cyber-glow);
+}
+
+/* 科技感发光文字 */
+.cyber-glow-text {
+  background: linear-gradient(135deg, var(--cyber-accent) 0%, var(--cyber-accent-purple) 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+  text-shadow: 0 0 30px var(--cyber-glow);
+}
+
+/* 科技感边框动画 */
+.cyber-border-glow {
+  position: relative;
+}
+
+.cyber-border-glow::before {
+  content: '';
+  position: absolute;
+  inset: -2px;
+  border-radius: inherit;
+  background: linear-gradient(135deg, var(--cyber-accent), var(--cyber-accent-purple), var(--cyber-accent));
+  background-size: 200% 200%;
+  animation: border-flow 3s ease infinite;
+  z-index: -1;
+  opacity: 0;
+  transition: opacity 0.3s ease;
+}
+
+.cyber-border-glow:hover::before {
+  opacity: 1;
+}
+
+@keyframes border-flow {
+  0% { background-position: 0% 50%; }
+  50% { background-position: 100% 50%; }
+  100% { background-position: 0% 50%; }
+}
+
+/* 科技感滚动条 */
+.cyber-scrollbar::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+.cyber-scrollbar::-webkit-scrollbar-track {
+  background: var(--cyber-surface);
+  border-radius: 3px;
+}
+
+.cyber-scrollbar::-webkit-scrollbar-thumb {
+  background: var(--cyber-border);
+  border-radius: 3px;
+  transition: background 0.3s ease;
+}
+
+.cyber-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: var(--cyber-accent);
+}
+
+/* 科技感加载动画 */
+.cyber-loader {
+  width: 40px;
+  height: 40px;
+  border: 3px solid var(--cyber-surface-light);
+  border-top-color: var(--cyber-accent);
+  border-radius: 50%;
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+/* 科技感脉冲点 */
+.cyber-pulse {
+  animation: pulse-glow 2s ease-in-out infinite;
+}
+
+@keyframes pulse-glow {
+  0%, 100% { box-shadow: 0 0 20px var(--cyber-glow); }
+  50% { box-shadow: 0 0 40px var(--cyber-glow); }
+}
+
+/* 浮动动画 */
+.cyber-float {
+  animation: float 3s ease-in-out infinite;
+}
+
+@keyframes float {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-10px); }
+}
+
+/* 科技感网格背景 */
+.cyber-grid-bg {
+  background-image: 
+    linear-gradient(rgba(0, 212, 255, 0.03) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(0, 212, 255, 0.03) 1px, transparent 1px);
+  background-size: 50px 50px;
+}
+
+/* 科技感背景动画粒子 */
+.cyber-particles {
+  position: relative;
+  overflow: hidden;
+}
+
+.cyber-particles::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: 
+    radial-gradient(circle at 20% 30%, rgba(0, 212, 255, 0.15) 0%, transparent 40%),
+    radial-gradient(circle at 80% 70%, rgba(168, 85, 247, 0.15) 0%, transparent 40%);
+  pointer-events: none;
+}
+
+/* 禁用 markdown-content 中的所有引用块样式 */
+.markdown-content,
+.markdown-content * {
+  quotes: none !important;
+}
+
+.markdown-content blockquote::before,
+.markdown-content blockquote::after,
+.markdown-content q::before,
+.markdown-content q::after {
+  content: none !important;
+  display: none !important;
+}
+
+.markdown-content blockquote,
+.markdown-content q {
+  border-left: none !important;
+  padding-left: 0 !important;
+  margin-left: 0 !important;
+  quotes: none !important;
+}
+
+.markdown-content p::before,
+.markdown-content p::after,
+.markdown-content div::before,
+.markdown-content div::after {
+  content: none !important;
+}
+
+.markdown-content > *::before,
+.markdown-content > *::after {
+  content: none !important;
+}
+
+.markdown-content *::before,
+.markdown-content *::after {
+  content: none !important;
+  quotes: none !important;
+}
+
