@@ -1,0 +1,32 @@
+【代码样例】
+```python
+import pandas as pd
+from sqlalchemy import create_engine
+from urllib.parse import quote_plus
+
+password = '[SQL_PASSWORD]'
+encoded_pwd = quote_plus(password)
+engine = create_engine(f'mysql+pymysql://[SQL_USER]:{encoded_pwd}@[SQL_URL]:[SQL_PORT]/[SQL_DATABASE]')
+
+df = pd.read_sql('[sql语句]', engine)
+#sql语句描述：[sql描述]
+
+#如果有多个数据分析和可视化任务，就需要多次执行下面的逻辑计算代码内容部分
+
+result = None
+###一下是需要您完成的代码部分###
+# 统计逻辑计算指标保存在result中
+# 逻辑计算代码内容部分
+# 如果各类指标，如单一指标可以以字典表示如{"key":"value"},
+# 如果各类指标比较多需要排序的，可以以字典加list表示如{"key":["","",...]}
+# 如果各类指标比较多需要排序还需要描述的，可以以字典加list加字典格式{"key":[{"k_1":"v_1"},{"k_2":"v_2"},...]}
+# 逻辑要求：[逻辑要求]
+###
+
+# 生成输出文件
+
+with open('[TXT_NAME]', 'w') as f:
+    f.write(result)
+df.to_csv('[CSV_NAME]', index=False, encoding='utf-8', quoting=csv.QUOTE_MINIMAL)
+print(result)
+```
