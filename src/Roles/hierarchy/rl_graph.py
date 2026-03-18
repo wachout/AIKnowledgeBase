@@ -394,7 +394,7 @@ class GraphBuilder:
     def build_hierarchical_graph(
         decision_agents: List[str],
         implementation_groups: List[List[str]],
-        validation_agents: List[str]
+        validation_agents: List[str] = None
     ) -> RLGraph:
         """
         构建层次化图结构
@@ -402,9 +402,10 @@ class GraphBuilder:
         Args:
             decision_agents: 决策层智能体ID列表
             implementation_groups: 实施层智能体组（每组一个列表）
-            validation_agents: 检验层智能体ID列表
+            validation_agents: 检验层智能体ID列表（已弃用，保留参数兼容）
         """
         graph = RLGraph()
+        validation_agents = validation_agents or []
         
         # 添加决策层节点
         for agent_id in decision_agents:

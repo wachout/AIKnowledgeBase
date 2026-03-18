@@ -144,251 +144,59 @@ class DynamicExpertAgent(BaseHierarchicalAgent):
         yield f"\n[{self.name}] ({self.domain})\n"
         yield f"{'─' * 40}\n"
         
-        # 保存当前任务上下文，供 JSON 解析失败时从 discuss 的 markdown 回退读取
-        self._current_task_context = task_context
-        
-        # 构建专业化提示词
         prompt = self._build_proposal_prompt(task_context)
-        
         response_parts = []
         async for chunk in self.call_llm(prompt):
             yield chunk
             response_parts.append(chunk)
-        
         full_response = "".join(response_parts)
         
-        # 解析结构化方案
-        self.last_proposal = self._parse_proposal(full_response)
-        
+        # 第二层已取消解析结构化，仅保留原文方案
+        self.last_proposal = ExpertProposal(
+            expert_role=self.role,
+            expert_name=self.name,
+            domain=self.domain,
+            proposal_content=full_response,
+        )
         yield f"\n{'─' * 40}\n"
+    
+    async def propose_solution_full(
+        self,
+        task_context: Dict[str, Any]
+    ) -> str:
+        """
+        并行模式：一次性返回完整发言内容（非流式）
+        
+        Args:
+            task_context: 任务上下文
+        
+        Returns:
+            完整的发言内容字符串
+        """
+        prompt = self._build_proposal_prompt(task_context)
+        response_parts = []
+        async for chunk in self.call_llm(prompt):
+            response_parts.append(chunk)
+        full_response = "".join(response_parts)
+        
+        # 保存到 last_proposal
+        self.last_proposal = ExpertProposal(
+            expert_role=self.role,
+            expert_name=self.name,
+            domain=self.domain,
+            proposal_content=full_response,
+        )
+        return full_response
     
     def get_proposal(self) -> Optional[ExpertProposal]:
         """获取最近的方案提议"""
         return self.last_proposal
     
-    def _parse_json_with_fallback(self, json_str: str) -> dict:
-        """
-        解析 JSON，失败时尝试修复（去除尾逗号、截断后补全括号）后重试。
-        若仍失败则抛出异常，由调用方触发 discuss 回退。
-        """
-        try:
-            return json.loads(json_str)
-        except json.JSONDecodeError as e:
-            # 尝试修复常见问题：尾逗号 ,] ,}
-            repaired = re.sub(r',\s*([}\]])', r'\1', json_str)
-            if repaired != json_str:
-                try:
-                    return json.loads(repaired)
-                except json.JSONDecodeError:
-                    pass
-            # 尝试截断：在错误位置之前找到最后一个 }，补全括号后重试
-            pos = getattr(e, 'pos', len(json_str))
-            if pos and pos > 10:
-                prefix = json_str[:pos]
-                last_brace = prefix.rfind('}')
-                last_bracket = prefix.rfind(']')
-                cut = max(last_brace, last_bracket)
-                if cut > 0:
-                    open_braces = prefix[: cut + 1].count('{') - prefix[: cut + 1].count('}')
-                    open_brackets = prefix[: cut + 1].count('[') - prefix[: cut + 1].count(']')
-                    repaired = json_str[: cut + 1] + ']' * max(0, open_brackets) + '}' * max(0, open_braces)
-                    try:
-                        return json.loads(repaired)
-                    except json.JSONDecodeError:
-                        pass
-            raise
-
-    def _parse_proposal(self, response: str) -> ExpertProposal:
-        """解析LLM返回的结构化方案"""
-        proposal = ExpertProposal(
-            expert_role=self.role,
-            expert_name=self.name,
-            domain=self.domain,
-            proposal_content=response
-        )
-        
-        try:
-            # 尝试提取JSON块
-            json_match = re.search(r'```json\s*([\s\S]*?)\s*```', response)
-            if json_match:
-                json_str = json_match.group(1)
-            else:
-                # 尝试直接匹配JSON对象
-                json_match = re.search(r'\{[\s\S]*\}', response)
-                if json_match:
-                    json_str = json_match.group(0)
-                else:
-                    logger.warning(f"[{self.name}] 未找到JSON结构，使用原始文本")
-                    return proposal
-            
-            # 去除控制字符，降低 Invalid control character 等解析错误
-            json_str = re.sub(r'[\x00-\x1f\x7f-\x9f]', ' ', json_str)
-            data = self._parse_json_with_fallback(json_str)
-            
-            # 填充结构化字段
-            proposal.professional_analysis = data.get('professional_analysis', '')
-            
-            # 解析实施步骤（含细化字段：acceptance_criteria）
-            raw_steps = data.get('implementation_steps', [])
-            proposal.implementation_steps = []
-            for i, step in enumerate(raw_steps):
-                if isinstance(step, dict):
-                    proposal.implementation_steps.append({
-                        "step": step.get('step', i + 1),
-                        "name": step.get('name', f'步骤{i+1}'),
-                        "description": step.get('description', ''),
-                        "duration": step.get('duration', '待定'),
-                        "deliverable": step.get('deliverable', ''),
-                        "acceptance_criteria": step.get('acceptance_criteria', ''),
-                    })
-                elif isinstance(step, str):
-                    proposal.implementation_steps.append({
-                        "step": i + 1,
-                        "name": step,
-                        "description": step,
-                        "duration": "待定",
-                        "deliverable": "",
-                        "acceptance_criteria": "",
-                    })
-            
-            proposal.estimated_duration = data.get('estimated_duration', '')
-            proposal.required_resources = data.get('required_resources', [])
-            
-            # 解析潜在风险
-            raw_risks = data.get('potential_risks', [])
-            proposal.potential_risks = []
-            for risk in raw_risks:
-                if isinstance(risk, dict):
-                    proposal.potential_risks.append({
-                        "risk": risk.get('risk', ''),
-                        "severity": risk.get('severity', '中'),
-                        "mitigation": risk.get('mitigation', '')
-                    })
-                elif isinstance(risk, str):
-                    proposal.potential_risks.append({
-                        "risk": risk,
-                        "severity": "中",
-                        "mitigation": ""
-                    })
-            
-            proposal.dependencies = data.get('dependencies', [])
-            proposal.confidence_level = float(data.get('confidence_level', 0.8))
-            proposal.verification_notes = data.get('verification_notes', '')
-            
-            logger.info(f"[{self.name}] 成功解析结构化方案: {len(proposal.implementation_steps)}个步骤, {len(proposal.potential_risks)}个风险")
-            
-        except (json.JSONDecodeError, KeyError, ValueError) as e:
-            logger.warning(f"[{self.name}] 解析结构化方案失败: {e}，尝试从 discuss 发言 markdown 回退")
-            fallback_content = self._try_load_proposal_from_discuss_md()
-            if fallback_content:
-                proposal.proposal_content = fallback_content
-                # 用第一层发言内容填充至少一个实施步骤，便于下游使用
-                proposal.implementation_steps = [{
-                    "step": 1,
-                    "name": "来自第一层发言",
-                    "description": fallback_content[:1000] + ("..." if len(fallback_content) > 1000 else ""),
-                    "duration": "待定",
-                    "deliverable": "",
-                    "acceptance_criteria": "",
-                }]
-                proposal.professional_analysis = fallback_content[:500] + ("..." if len(fallback_content) > 500 else "")
-                logger.info(f"[{self.name}] 已从 discuss 发言 markdown 回退填充方案")
-            else:
-                logger.warning(f"[{self.name}] 未找到可用的 discuss markdown，保留原始文本")
-        
-        return proposal
-    
-    def _try_load_proposal_from_discuss_md(self) -> Optional[str]:
-        """
-        当 JSON 解析失败时，从第一层讨论保存的 markdown 发言文件中读取内容。
-        查找 discuss_dir 下 expert_<名称或领域>_round*.md，取最新一份，提取「发言内容」或全文。
-        """
-        ctx = getattr(self, "_current_task_context", None) or {}
-        discuss_dir = ctx.get("discuss_dir") or ""
-        if not discuss_dir or not os.path.isdir(discuss_dir):
-            return None
-        # 文件名中领域可能带斜杠，保存时会被替换为下划线，如 expert_工业设计_生物形态学_round1_xxx.md
-        name_part = (self.name or self.domain or "").replace("/", "_").strip()
-        if not name_part:
-            return None
-        candidates = []
-        try:
-            for f in os.listdir(discuss_dir):
-                if not f.endswith(".md") or "round" not in f.lower():
-                    continue
-                # 优先 expert_*，其次 skeptic_expert_*（质疑者对本领域的意见也可作为参考）
-                if (f.startswith("expert_") or f.startswith("skeptic_expert_")) and name_part in f:
-                    path = os.path.join(discuss_dir, f)
-                    try:
-                        mtime = os.path.getmtime(path)
-                        # 专家发言优先于质疑者（expert_ 排在 skeptic_ 前面）
-                        priority = 0 if f.startswith("expert_") else 1
-                        candidates.append((priority, mtime, path))
-                    except OSError:
-                        continue
-            if not candidates:
-                # 未找到 .md 时，尝试从 .json 读取 speech
-                return self._try_load_speech_from_discuss_json(discuss_dir)
-            # 先按 priority（expert 优先），再按 mtime 取最新
-            candidates.sort(key=lambda x: (x[0], -x[1]))
-            latest_path = candidates[0][2]
-            with open(latest_path, "r", encoding="utf-8") as fp:
-                raw = fp.read()
-        except (OSError, IOError) as e:
-            logger.debug(f"[{self.name}] 读取 discuss markdown 失败: {e}")
-            return self._try_load_speech_from_discuss_json(discuss_dir) if discuss_dir else None
-        # 提取 ## 发言内容 到文末或下一级 ##
-        match = re.search(r"##\s*发言内容\s*\n([\s\S]*?)(?=\n##\s|\Z)", raw)
-        if match:
-            return match.group(1).strip()
-        # 若无「发言内容」节，则取「思考过程」之后到下一 ##
-        match = re.search(r"##\s*思考过程\s*\n([\s\S]*?)(?=\n##\s|\Z)", raw)
-        if match:
-            return match.group(1).strip()
-        # 若仍无，尝试从 discuss 下的 .json 文件读取 speech 字段
-        fallback_json = self._try_load_speech_from_discuss_json(discuss_dir)
-        if fallback_json:
-            return fallback_json
-        return raw.strip() or None
-
-    def _try_load_speech_from_discuss_json(self, discuss_dir: str) -> Optional[str]:
-        """当 markdown 未找到或内容为空时，从 discuss 下的 expert_*.json 或 skeptic_expert_*.json 读取 speech 字段。"""
-        name_part = (self.name or self.domain or "").replace("/", "_").strip()
-        if not name_part:
-            return None
-        candidates = []
-        try:
-            for f in os.listdir(discuss_dir):
-                if not f.endswith(".json") or "round" not in f.lower():
-                    continue
-                if not (f.startswith("expert_") or f.startswith("skeptic_expert_")):
-                    continue
-                if name_part not in f:
-                    continue
-                path = os.path.join(discuss_dir, f)
-                try:
-                    mtime = os.path.getmtime(path)
-                    candidates.append((mtime, path))
-                except OSError:
-                    continue
-            if not candidates:
-                return None
-            # 优先 expert_*，再 skeptic_expert_*；同类型取最新
-            def sort_key(item):
-                mtime, path = item
-                fname = os.path.basename(path)
-                priority = 0 if fname.startswith("expert_") else 1
-                return (priority, -mtime)
-            candidates.sort(key=sort_key)
-            with open(candidates[0][1], "r", encoding="utf-8") as fp:
-                obj = json.load(fp)
-            speech = obj.get("speech") or obj.get("thinking") or ""
-            return speech.strip() or None
-        except (OSError, json.JSONDecodeError, KeyError):
-            return None
-
     def _build_proposal_prompt(self, task_context: Dict[str, Any]) -> str:
         """构建专业化提示词（紧扣用户目标、第一层讨论与质疑者意见、可实施措施并反复验证）"""
+        my_tasks = task_context.get("my_tasks")  # 实施任务分析分配的本角色任务列表
+        if my_tasks and isinstance(my_tasks, list):
+            return self._build_proposal_prompt_by_tasks(task_context, my_tasks)
         task = task_context.get('task', {})
         task_name = task.get('name', '未知任务') if isinstance(task, dict) else str(task)
         task_desc = task.get('description', '') if isinstance(task, dict) else ''
@@ -490,39 +298,42 @@ class DynamicExpertAgent(BaseHierarchicalAgent):
 
 请直接输出你的JSON方案：
 """
-    
-    async def review_proposal(
-        self,
-        proposal: Dict[str, Any],
-        task_context: Dict[str, Any] = None
-    ) -> AsyncGenerator[str, None]:
-        """
-        审阅其他专家的方案，给出专业意见
-        
-        Args:
-            proposal: 待审阅的专家方案 {expert_name, domain, content, ...}
-            task_context: 任务上下文
-        
-        Yields:
-            审阅过程的输出
-        """
-        target_name = proposal.get('expert_name', '未知专家')
-        target_domain = proposal.get('domain', '未知领域')
-        yield f"\n[{self.name}] 审阅 {target_name} 的方案...\n"
-        
-        prompt = self._build_review_prompt(proposal, task_context)
-        
-        response_parts = []
-        async for chunk in self.call_llm(prompt):
-            yield chunk
-            response_parts.append(chunk)
-        
-        full_response = "".join(response_parts)
-        
-        # 解析审阅结果
-        self.last_review = self._parse_review(full_response, target_name, target_domain)
-        yield "\n"
 
+    def _build_proposal_prompt_by_tasks(self, task_context: Dict[str, Any], my_tasks: List[str]) -> str:
+        """按实施任务分析分配的任务列表构建提示；若提供第一层本领域汇总文档，要求先阅读再细化实施步骤。"""
+        user_goal = task_context.get("user_goal", "") or task_context.get("discussion_summary", "")
+        role_prompt = task_context.get("role_prompt", "")
+        tasks_text = "\n".join(f"- {t}" for t in (my_tasks or [])[:50])
+        layer1_domain_md = (task_context.get("layer1_domain_summary_md") or "").strip()
+        layer1_block = ""
+        intro = "请针对每项任务给出可执行方案（步骤、交付物、预估时长），直接以 Markdown 输出，无需 JSON。"
+        if layer1_domain_md:
+            layer1_block = f"""
+## 第一层本领域讨论汇总（请先阅读上述角色分工与本段汇总，再据此细化实施步骤）
+以下为第一层讨论中与你本领域相关的专家与质疑者汇总，请结合你负责的任务逐项给出可执行方案。
+
+{layer1_domain_md[:12000]}
+
+---
+"""
+            intro = "请**先阅读下方第一层本领域汇总文档**，再针对每项任务给出可执行方案（步骤、交付物、预估时长），直接以 Markdown 输出，无需 JSON。"
+        return f"""你是一位实施角色「{self.name}」，负责执行以下分配给你的任务。{intro}
+
+{role_prompt}
+
+## 用户/项目目标
+{user_goal[:2000] if user_goal else "（见第一层讨论汇总）"}
+{layer1_block}
+## 你负责的任务（请逐项给出可执行方案）
+{tasks_text}
+
+## 输出要求
+- 先结合第一层本领域讨论要点，再按上述任务逐项写出：任务名称、实施步骤（具体可执行）、交付物、预估时长。
+- 使用清晰 Markdown（标题、列表），无需 JSON。
+- 确保步骤可落地、可验收。
+请直接输出你的方案：
+"""
+    
     async def revise_proposal_after_skeptic(
         self,
         current_proposal_content: str,
@@ -554,98 +365,81 @@ class DynamicExpertAgent(BaseHierarchicalAgent):
 1. 保留你仍坚持的合理内容，对质疑中合理的部分进行补充、修正或澄清。
 2. 若方案含 JSON 或结构化内容，修订后请保持合法 JSON 与原有字段结构。
 3. 直接输出修订后的**完整方案**（可含 markdown 与代码块），不要只写修改片段，不要加「修订版」等前缀。
+4. **思维与边界**：可在**本领域内**突破思维、创新完成任务；但在**角色领域内**不要随意突破边界，勿越界到其他专业。
 """
         parts = []
         async for chunk in self.call_llm(prompt):
             parts.append(chunk)
         revised = "".join(parts).strip()
         return revised if revised else current_proposal_content
-    
-    def _build_review_prompt(
+
+    async def review_proposal(
         self,
         proposal: Dict[str, Any],
-        task_context: Dict[str, Any] = None
-    ) -> str:
-        """构建专业审阅提示词"""
-        target_name = proposal.get('expert_name', '未知专家')
-        target_domain = proposal.get('domain', '未知领域')
-        content = proposal.get('content', '')[:2000]
+        task_context: Dict[str, Any],
+    ) -> AsyncGenerator[str, None]:
+        """
+        审阅其他专家的方案（专家交叉审阅）
         
-        expertise_text = "、".join(self.expertise) if self.expertise else self.domain
+        Args:
+            proposal: 待审阅的方案，包含 expert_name, content 等
+            task_context: 任务上下文
         
-        return f"""你是{self.name}，专精于{self.domain}（{expertise_text}）。
+        Yields:
+            审阅过程输出
+        """
+        expert_name = proposal.get('expert_name', '未知专家')
+        proposal_content = proposal.get('content', '')
+        
+        yield f"\n[{self.name}] 审阅 {expert_name} 的方案\n"
+        separator = '\u2500' * 30
+        yield f"{separator}\n"
+        
+        prompt = f"""你是{self.name}，专精于{self.domain}。
+请从你的专业角度审阅以下方案，给出客观的评价。
 
-请从你的专业角度审阅以下专家的方案，给出客观的专业评价。
+## 待审阅方案（来自 {expert_name}）
+{proposal_content[:6000]}
 
-## 待审阅方案
-**专家**: {target_name} ({target_domain})
-**方案内容**:
-{content}
+## 请输出你的审阅意见，包括：
+1. **总体评价**：方案的优点与不足
+2. **专业视角**：从{self.domain}角度的建议
+3. **立场**：你对该方案的态度（strongly_agree/agree/neutral/disagree/strongly_disagree）
+4. **改进建议**：具体可行的改进方向
 
-## 审阅要求
-
-请从以下角度进行审阅：
-1. 方案的可行性和专业性
-2. 与你的专业领域的协同/冲突
-3. 潜在的改进建议
-
-**请严格按以下JSON格式输出**（用```json```代码块包裹）：
-
-```json
-{{{{{{
-  "stance": "agree/neutral/disagree",
-  "strengths": ["方案优点1", "方案优点2"],
-  "concerns": ["担忧点1", "担忧点2"],
-  "suggestions": ["改进建议1", "改进建议2"],
-  "synergy_with_my_domain": "与我的领域({self.domain})的协同说明",
-  "confidence": 0.8
-}}}}}}
-```
-
-请直接输出JSON审阅意见：
+请简洁输出你的审阅意见：
 """
-    
-    def _parse_review(self, response: str, target_name: str, target_domain: str) -> Dict[str, Any]:
-        """解析审阅结果"""
-        review = {
-            "reviewer": self.name,
-            "reviewer_domain": self.domain,
-            "target_expert": target_name,
-            "target_domain": target_domain,
-            "stance": "neutral",
-            "strengths": [],
-            "concerns": [],
-            "suggestions": [],
-            "synergy_with_my_domain": "",
-            "confidence": 0.8
+        
+        response_parts = []
+        async for chunk in self.call_llm(prompt):
+            yield chunk
+            response_parts.append(chunk)
+        
+        full_response = "".join(response_parts)
+        
+        # 解析立场
+        stance = 'neutral'
+        response_lower = full_response.lower()
+        if 'strongly_agree' in response_lower or '非常赞同' in full_response:
+            stance = 'strongly_agree'
+        elif 'strongly_disagree' in response_lower or '强烈反对' in full_response:
+            stance = 'strongly_disagree'
+        elif 'agree' in response_lower or '赞同' in full_response:
+            stance = 'agree'
+        elif 'disagree' in response_lower or '反对' in full_response:
+            stance = 'disagree'
+        
+        # 保存审阅结果
+        self.last_review = {
+            'reviewer': self.name,
+            'reviewer_domain': self.domain,
+            'reviewed_expert': expert_name,
+            'stance': stance,
+            'review_content': full_response,
         }
         
-        try:
-            json_match = re.search(r'```json\s*([\s\S]*?)\s*```', response)
-            if json_match:
-                json_str = json_match.group(1)
-            else:
-                json_match = re.search(r'\{[\s\S]*\}', response)
-                if json_match:
-                    json_str = json_match.group(0)
-                else:
-                    logger.warning(f"[{self.name}] 审阅结果无JSON，使用默认")
-                    return review
-            
-            data = json.loads(json_str)
-            review["stance"] = data.get("stance", "neutral")
-            review["strengths"] = data.get("strengths", [])
-            review["concerns"] = data.get("concerns", [])
-            review["suggestions"] = data.get("suggestions", [])
-            review["synergy_with_my_domain"] = data.get("synergy_with_my_domain", "")
-            review["confidence"] = float(data.get("confidence", 0.8))
-            
-            logger.info(f"[{self.name}] 审阅 {target_name}: stance={review['stance']}, concerns={len(review['concerns'])}")
-        except (json.JSONDecodeError, KeyError, ValueError) as e:
-            logger.warning(f"[{self.name}] 解析审阅结果失败: {e}")
-        
-        return review
-
+        yield f"\n{separator}\n"
+    
     def get_prompt(self, context: Dict[str, Any]) -> str:
         """获取通用提示词"""
         return self._build_proposal_prompt(context)

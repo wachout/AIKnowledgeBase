@@ -19,9 +19,11 @@ from Agent.AgenticSqlAgent.agents.intent_recognition_agent import IntentRecognit
 # from Agent.AgenticSqlAgent.agents.database_check_agent import DatabaseCheckAgent
 from Agent.AgenticSqlAgent.SqlGeneration.sql_generation_flow import SqlGenerationFlow
 from Agent.AgenticSqlAgent.RuleLogic.logic_calculation_agent import LogicCalculationAgent
-from Sql.schema_vector import SqlSchemaVectorAgent
+from Config.elasticsearch_config import is_elasticsearch_enabled
+from Control.control_elastic import CControl as ElasticsearchControl
 import json
 from Db.sqlite_db import cSingleSqlite
+from Agent.csv_file_agent import CsvFileAgent, parse_csv_files
 
 
 def run_sql_agentic_search(sql_id: str, query: str, user_id: str = None, 
@@ -236,56 +238,48 @@ def run_sql_agentic_search(sql_id: str, query: str, user_id: str = None,
                 "should_continue": True
             })
         
-        # 步骤1.3: Milvus向量搜索（通过sql_id作为partition查询相关表）
-        print("\n🔍 步骤1.3: Milvus向量搜索相关表...")
+        # 步骤1.3: Elasticsearch 搜索相关表（表结构按 control_sql 保存：knowledge_id=sql_id, file_id=table_id, title=表名/描述, content=列注释）
+        print("\n🔍 步骤1.3: Elasticsearch 搜索相关表...")
         table_info_list = []
+        table_ids = set()
+        results = []
         try:
-            schema_vector_agent = SqlSchemaVectorAgent(sql_id=sql_id)
-            # 通过sql_id作为partition进行语义搜索
-            search_result = schema_vector_agent.search_graph_nodes(
-                query=query,
-                sql_id=sql_id,
-                limit=10  # 最多返回10个相关表
-            )
-            
-            if search_result.get("success"):
-                results = search_result.get("results", [])
-                print(f"   ✅ Milvus搜索完成，找到 {len(results)} 个相关表节点")
-                
-                # 提取唯一的table_id
-                table_ids = set()
-                for result in results:
-                    table_id = result.get("table_id", "")
-                    if table_id:
-                        table_ids.add(table_id)
-                
-                print(f"   📋 提取到 {len(table_ids)} 个唯一的表ID")
-                
-                # 通过table_id获取表信息
-                # 先获取所有表信息，然后匹配table_id
+            if is_elasticsearch_enabled():
+                elasticsearch_obj = ElasticsearchControl()
+                # knowledge_id 即 sql_id；permission_flag=True 表示可访问该知识库下所有表
+                results = elasticsearch_obj.search_documents(
+                    knowledge_id=sql_id,
+                    user_id=user_id or "",
+                    permission_flag=True,
+                    search_query=query,
+                    size=10,
+                    use_hybrid_search=True
+                )
+                # 命中文档的 file_id 即 table_id（与 control_sql 保存格式一致）
+                for doc in results or []:
+                    file_id = doc.get("file_id", "")
+                    if file_id:
+                        table_ids.add(file_id)
+                print(f"   ✅ Elasticsearch 搜索完成，找到 {len(table_ids)} 个相关表")
+            else:
+                print(f"   ⚠️ Elasticsearch 未启用，跳过相关表搜索")
+
+            if is_elasticsearch_enabled() and table_ids:
                 all_tables = query_tables_by_sql_id(sql_id)
                 table_id_to_table = {t.get("table_id"): t for t in all_tables}
-                
                 for table_id in table_ids:
                     try:
-                        # 从已查询的表信息中获取
                         table_info = table_id_to_table.get(table_id)
                         if not table_info:
                             print(f"   ⚠️ 未找到表ID {table_id} 的信息")
                             continue
-                        
-                        # 获取列信息
                         columns = query_columns_by_table_id(table_id)
-                        
-                        # 构建表信息
                         table_data = {
                             "table_id": table_id,
                             "table_name": table_info.get("table_name", ""),
                             "table_description": table_info.get("table_description", ""),
                             "columns": []
                         }
-                        
-                        # 添加列信息
                         for col in columns:
                             col_info = col.get("col_info", {})
                             table_data["columns"].append({
@@ -293,32 +287,23 @@ def run_sql_agentic_search(sql_id: str, query: str, user_id: str = None,
                                 "col_type": col.get("col_type", ""),
                                 "comment": col_info.get("comment", "")
                             })
-                        
                         table_info_list.append(table_data)
                         print(f"   ✅ 获取表信息: {table_data['table_name']} ({len(table_data['columns'])} 列)")
-                        
                     except Exception as e:
                         print(f"   ⚠️ 获取表 {table_id} 信息失败: {e}")
                         continue
-                
-                _notify_step("step_1_3_milvus_search", {
-                    "success": True,
-                    "search_results_count": len(results),
-                    "table_ids_found": len(table_ids),
-                    "table_info_count": len(table_info_list)
-                })
-            else:
-                print(f"   ⚠️ Milvus搜索失败: {search_result.get('message', '未知错误')}")
-                _notify_step("step_1_3_milvus_search", {
-                    "success": False,
-                    "error": search_result.get("message", "Milvus搜索失败")
-                })
+            _notify_step("step_1_3_elasticsearch_search", {
+                "success": True,
+                "search_results_count": len(results),
+                "table_ids_found": len(table_ids),
+                "table_info_count": len(table_info_list)
+            })
         except Exception as e:
-            print(f"   ⚠️ Milvus搜索异常: {e}")
+            print(f"   ⚠️ Elasticsearch 搜索异常: {e}")
             traceback.print_exc()
-            _notify_step("step_1_3_milvus_search", {
+            _notify_step("step_1_3_elasticsearch_search", {
                 "success": False,
-                "error": f"Milvus搜索异常: {str(e)}"
+                "error": f"Elasticsearch 搜索异常: {str(e)}"
             })
         
         # 步骤1.5: 问题拆解与逻辑分析（带表信息语义核对）

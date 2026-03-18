@@ -6,6 +6,7 @@
 
 import json
 import logging
+import os
 from typing import Dict, Any, List
 from .base_agent import BaseAgent, WorkingStyle
 
@@ -27,13 +28,15 @@ class Skeptic(BaseAgent):
 
         super().__init__(
             name=f"{target_expert.name}质疑者",
-            role_definition=f"{target_expert.domain}领域质疑者，专门对{target_expert.name}的观点进行批判性分析和风险识别",
+            role_definition=f"{target_expert.domain}领域质疑者，专门对{target_expert.name}的观点进行批判性分析和风险识别；引导被质疑者在专业领域内突破思维以更好完成任务，并提醒其勿随意突破本领域边界。",
             professional_skills=[
                 "批判性思维",
                 "风险识别",
                 "逻辑推理",
                 "证据评估",
                 "替代方案生成",
+                "思维突破性引导（鼓励领域内创新与突破定式）",
+                "知识领域边界意识（提醒在领域内可突破、勿越界）",
                 f"{target_expert.domain}领域知识"
             ],
             working_style=WorkingStyle.AGGRESSIVE_INNOVATIVE,  # 质疑者通常更激进
@@ -43,7 +46,9 @@ class Skeptic(BaseAgent):
                 "识别潜在风险和盲点",
                 "提供替代观点和解决方案",
                 "促进深入讨论和思考",
-                "避免个人攻击，聚焦问题本身"
+                "避免个人攻击，聚焦问题本身",
+                "思维突破性：提醒被质疑者可在本领域内突破思维定式、创新完成目标",
+                "领域边界：提醒被质疑者在自身领域内可大胆突破，但不要随意越界到其他专业，保持专业边界"
             ],
             output_format="""
 **质疑分析结果：**
@@ -97,15 +102,45 @@ class Skeptic(BaseAgent):
 
     def question_expert(self, expert_opinion: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
         """
-        对专家意见进行质疑
-
-        Args:
-            expert_opinion: 专家的意见
-            context: 讨论上下文
-
-        Returns:
-            质疑结果
+        对专家意见进行质疑。可使用 web_search_tool 进行网络/论文检索，并结合 discussion/discussion_id/files 中的本地论文进行质疑。
         """
+        # 若有工具管理器，先做一次与专家观点相关的网络/学术检索，结果并入 context 供构建质疑使用
+        tool_mgr = getattr(self, "_tool_manager", None)
+        layer = context.get("skeptic_layer") or context.get("revision_round") or 1
+        if tool_mgr and expert_opinion.get("content"):
+            try:
+                base_content = (expert_opinion.get("content") or "")[:150].strip() or context.get("topic", "research")
+                # 第二层：额外用「实施 参数 指标 数据」类查询，便于查到可反馈给发言者的具体数据
+                if layer == 2:
+                    query_params = f"{base_content} 实施 参数 指标 数据 具体数值"
+                else:
+                    query_params = base_content
+                query = query_params
+                for tool_name in ("academic_paper_search", "web_search"):
+                    tool = tool_mgr.get_tool(tool_name) if hasattr(tool_mgr, "get_tool") else None
+                    if not tool:
+                        continue
+                    try:
+                        discussion_id = context.get("discussion_id", "")
+                        params = {"query": query, "limit": 5}
+                        if tool_name == "academic_paper_search" and discussion_id:
+                            params["save_path"] = os.path.join("discussion", discussion_id, "files")
+                        result = tool_mgr.execute_tool(tool_name, params) if hasattr(tool_mgr, "execute_tool") else None
+                        if result and getattr(result, "success", False) and getattr(result, "data", None):
+                            context = dict(context)
+                            context["network_search_results"] = context.get("network_search_results", [])
+                            if tool_name == "academic_paper_search":
+                                papers = (result.data.get("latest_10_papers") or result.data.get("papers") or [])[:5]
+                                context["network_search_results"].extend([{"source": "academic", "title": p.get("title"), "abstract": (p.get("abstract") or "")[:400]} for p in papers])
+                            else:
+                                res_list = (result.data.get("results") or [])[:5]
+                                context["network_search_results"].extend([{"source": "web", "title": r.get("title"), "snippet": r.get("snippet", "")} for r in res_list])
+                            break
+                    except Exception as e:
+                        logger.warning(f"质疑者检索/下载失败 ({tool_name})，继续下一工具或仅用上下文质疑: {e}")
+            except Exception as e:
+                logger.warning(f"质疑者检索辅助失败，继续执行质疑: {e}")
+
         question_prompt = self._build_question_prompt(expert_opinion, context)
 
         try:
@@ -125,10 +160,54 @@ class Skeptic(BaseAgent):
             return self._create_fallback_question(expert_opinion)
 
     def _build_question_prompt(self, expert_opinion: Dict[str, Any], context: Dict[str, Any]) -> str:
-        """构建质疑提示（质疑偏向具像化、计划与实施，避免停留在虚理论）"""
-        prompt = f"""你是一位{self.target_expert.domain}领域的质疑者，专门对{self.target_expert.name}的观点进行批判性分析。
+        """构建质疑提示。第二层（revision_round=2）时侧重实施参数/指标/数据查询并反馈给发言者，并提醒可行性、步骤详细度、不要空理论。"""
+        layer = context.get("skeptic_layer") or context.get("revision_round") or 1
+        local_block = ""
+        if context.get("local_papers_summary"):
+            papers_dir = context.get("local_papers_dir") or context.get("papers_downloaded_to") or os.path.join("discussion", (context.get("discussion_id") or "discussion_id"), "files")
+            local_block = f"""
+**可参考的本地论文（来自 {papers_dir}，可结合以下摘要支撑或反驳专家观点/查询实施参数与数据）：**
+{context.get('local_papers_summary', '')}
+"""
+        network_block = ""
+        if context.get("network_search_results"):
+            network_block = "\n**网络/学术检索结果（可引用以支撑质疑或提取参数/指标/数据）：**\n" + "\n".join(
+                f"- [{r.get('source', '')}] {r.get('title', '')}: {(r.get('abstract') or r.get('snippet') or '')[:200]}"
+                for r in context["network_search_results"][:8]
+            )
 
-**重要原则：你的质疑必须偏向「具像化的计划与实施」，不要停留在虚理论。** 多问「怎么落地、谁来做、何时验收、产出是什么」，少问抽象概念。
+        if layer == 2:
+            # 第二层：查询实施所需参数/指标/暂无法确定的信息，明确反馈给发言者，并提醒可行性、步骤详细度、不要空理论；同时体现思维突破性与领域边界
+            prompt = f"""你是一位{self.target_expert.domain}领域的质疑者，本轮为**第二层**。你的职责包括**思维突破性**（鼓励被质疑者在本领域内突破思维、更好完成任务）与**知识领域边界**（提醒其在领域内可突破，但勿随意越界到其他专业）。请使用网络检索与 discussion/discussion_id/files 中的论文，**查询实施所需的参数、指标、暂无法确定的信息、需明确的数据**，将查到的**具体数据、参数、指标**在下方明确反馈给{self.target_expert.name}；并**明确提醒**发言者：在专业领域不违背第一性原理、逻辑可推理、可实施执行的前提下，请注重**实施的可行性、步骤的详细度，不要空理论**。
+
+**你可以使用：** (1) 上下文中的「本地论文摘要」 (2) 「网络/学术检索结果」，从中提取或归纳出与实施相关的**参数、指标、数值、标准、时间节点**等需明确的信息，**逐条列出并反馈给发言者**。
+
+**目标专家信息：**
+- 姓名：{self.target_expert.name}
+- 领域：{self.target_expert.domain}
+- 专长：{self.target_expert.expertise_area}
+
+**专家当前发言（请针对其实施方案查找并反馈缺失或待定的参数/指标/数据）：**
+{expert_opinion.get('content', '')}
+{local_block}
+{network_block}
+
+**第二层任务：**
+1. **数据与参数反馈**：从上述本地论文与检索结果中，找出与专家方案实施相关的**参数、指标、阈值、标准、典型数值、时间范围**等；若检索中无直接数据，则列出「尚需明确的数据项」并建议如何获取。
+2. **明确反馈**：将上述信息清晰、逐条地反馈给{self.target_expert.name}，便于其在修订稿中吸纳。
+3. **对发言者的提醒**：在结尾明确提醒：在专业领域不违背第一性原理、逻辑可推理、可实施执行的前提下，请特别注重**实施的可行性、步骤的详细度，避免空理论**；若质疑者已提供具体参数或数据，请在修订稿中体现。
+4. **思维与边界**：提醒{self.target_expert.name}——可在**本领域内**突破思维、创新完成任务；但在角色**领域内**不要随意突破边界，勿越界到其他专业。
+
+请保持专业、建设性，输出可直接交给发言者使用的「数据反馈 + 提醒」内容。"""
+
+            return prompt
+
+        # 第一层：具像化与可执行性质疑
+        prompt = f"""你是一位{self.target_expert.domain}领域的质疑者，专门对{self.target_expert.name}的观点进行批判性分析。你的职责包括：**思维突破性**（鼓励被质疑者在本领域内突破思维定式、更好完成任务）与**知识领域边界**（提醒其在自身领域内可大胆突破，但不要随意越界到其他专业）。
+
+**你可以使用：** (1) 上下文中的「本地论文摘要」（来自 discussion/discussion_id/files 的论文）与 (2) 若已提供则「网络/学术检索结果」，结合这些材料对专家观点进行有理有据的质疑。
+
+**重要原则：质疑必须偏向「具像化的计划与实施」，不要停留在虚理论。** 多问「怎么落地、谁来做、何时验收、产出是什么」，少问抽象概念。
 
 **目标专家信息：**
 - 姓名：{self.target_expert.name}
@@ -138,9 +217,11 @@ class Skeptic(BaseAgent):
 
 **专家观点：**
 {expert_opinion.get('content', '')}
+{local_block}
+{network_block}
 
-**讨论上下文：**
-{json.dumps(context, ensure_ascii=False, indent=2)}
+**讨论上下文（含 discussion_id、近期发言等）：**
+{json.dumps({k: v for k, v in context.items() if k not in ("local_papers_summary", "network_search_results")}, ensure_ascii=False, indent=2)}
 
 **质疑任务（优先具像化与可执行性）：**
 
@@ -160,6 +241,10 @@ class Skeptic(BaseAgent):
 - 落地过程中有哪些具体风险？如何验证每一步是否达标？
 
 **请避免**：只讨论抽象概念、纯理论或空泛的「应该加强」「需要重视」；**务必**把质疑落在具体计划、步骤、责任与验收上。
+
+**思维与边界提醒（请在质疑中或结尾自然体现）：**
+- **思维突破性**：鼓励{self.target_expert.name}在**本领域内**突破思维定式、创新完成目标，可提醒其「可在专业内大胆突破以更好完成任务」。
+- **知识领域边界**：提醒被质疑者——在自身**角色领域内**可突破思维，但**不要随意突破领域边界**，勿越界到其他专业，保持专业边界。
 
 {self.output_format}
 

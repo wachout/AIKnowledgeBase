@@ -256,7 +256,7 @@ class DynamicAgentFactory:
         expert_specs: List[Dict[str, Any]]
     ) -> List[DynamicExpertAgent]:
         """
-        批量创建专家智能体
+        批量创建专家智能体（串行逐个创建，不并行）。
         
         Args:
             expert_specs: 专家规格列表

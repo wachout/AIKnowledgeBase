@@ -15,12 +15,13 @@
 #### 🎭 主要协调器
 - **RoundtableDiscussion**: 协调整个多智能体讨论流程的主控制器
 
-#### 🤖 智能体角色 (9个专用智能体)
-- **Scholar** - 任务分析与角色确定
+#### 🤖 智能体角色
+- **IdeationAgent（自主构思）** - 协助任务分析与角色确定：理解任务后调用 Semantic Scholar 与 arXiv 检索论文，将 PDF 保存到 `data/{任务id}/`，基于论文产生逻辑可推理、不违背科学原理的想法，并将想法与论文依据提供给学者
+- **Scholar** - 任务分析与角色确定（接收自主构思的想法与论文依据）
 - **Moderator** - 会议管理和议程控制
 - **DomainExpert** - 领域专家 (动态创建)
 - **Skeptic** - 质疑者 (批判性思维)
-- **Synthesizer** - 综合者 (观点整合)
+- ~~**Synthesizer** - 综合者~~（已取消：第一层结果直接按领域传第二层）
 - **Facilitator** - 协调者 (冲突化解)
 - **DataAnalyst** - 数据分析师 (数据支撑)
 - **RiskManager** - 风险管理者 (风险评估)
@@ -38,16 +39,18 @@
 - ✅ 协作精神 (积极回应、共识构建、建设性批评)
 
 ### 讨论流程
-1. **学者分析** - 分析用户任务，确定所需专家角色
-2. **自动建模** - 根据任务动态创建领域专家和质疑者
-3. **会议开启** - 主持人介绍议程和参与者
-4. **多轮讨论** - 协调发言顺序的结构化讨论
-5. **质疑质询** - 每个专家发言后接受质疑者提问
-6. **综合整合** - 综合者整合各方观点
+1. **自主构思** - 根据任务检索论文（arXiv + Semantic Scholar），PDF 保存至 `data/{discussion_id}/`，产生有文献支撑的想法，供学者使用
+2. **学者分析** - 结合自主构思的想法与论文依据，分析用户任务并确定所需专家角色
+3. **自动建模** - 根据任务动态创建领域专家和质疑者
+4. **会议开启** - 主持人介绍议程和参与者
+5. **多轮讨论** - 协调发言顺序的结构化讨论
+6. **质疑质询** - 每个专家发言后接受质疑者提问
 7. **用户决策** - 用户控制讨论流程 (继续/停止/调整/提问)
 
+第一层**已取消综合者/梳理逻辑智能体**：各智能体输出直接通过 `rounds` 按领域传给第二层对应实施智能体。
+
 ### 高级特性
-- 🔄 动态智能体创建基于任务分析
+- 🔄 动态智能体创建基于任务分析；生成领域专家时角色提示词参考 `personnel/expert_role_prompt_template.py`（含 Role/Background/Profile/Skills/Goals/Constrains/Workflow/OutputFormat/Suggestions/Initialization 结构，示例为机械设计工程师）
 - 📊 共识强度实时计算与追踪
 - ⚠️ 风险评估与缓解策略
 - 📈 进度监控与里程碑管理
@@ -71,6 +74,7 @@ src/Roles/
 │   ├── scholar.py                # 学者智能体
 │   ├── moderator.py              # 主持人
 │   ├── domain_expert.py          # 领域专家
+│   ├── expert_role_prompt_template.py  # 专家角色提示词参考模板（自动生成角色时参照）
 │   ├── skeptic.py                # 质疑者
 │   ├── synthesizer.py            # 综合者
 │   ├── facilitator.py            # 协调者
@@ -90,21 +94,84 @@ src/Roles/
 2. 系统自动触发圆桌讨论流程
 
 ### 工作流程
-1. **任务分析**: 学者智能体分析用户任务，确定所需专业领域
-2. **智能体创建**: 基于分析结果动态创建相应领域专家
-3. **讨论执行**: 进行结构化多轮讨论
+1. **自主构思**: 自主构思智能体根据任务调用论文检索（Semantic Scholar、arXiv），将最新 10 篇 PDF 保存到 `data/{任务id}/`，阅读并产生逻辑可推理、有文献支撑的想法
+2. **任务分析**: 学者智能体结合自主构思的想法与论文依据，分析用户任务并确定所需专业领域与角色
+3. **智能体创建**: 基于分析结果动态创建相应领域专家
+4. **讨论执行**: 进行结构化多轮讨论
    - 协调发言顺序
    - 专家发表意见
    - 质疑者提出质疑
    - 综合者整合观点
-4. **用户交互**: 每轮结束后等待用户决策
-5. **报告生成**: 讨论结束后生成全面报告
+5. **用户交互**: 每轮结束后等待用户决策
+6. **报告生成**: 讨论结束后生成全面报告
 
 ### 讨论特点
 - 🎯 **协调发言**: Facilitator 确保讨论有序进行
 - 🔍 **深度质疑**: Skeptic 对每个观点进行批判性审查
 - 🔄 **动态调整**: 用户可随时调整讨论方向
 - 📊 **实时追踪**: ConsensusTracker 监控共识形成
+
+## 📐 第一层 → 第二层 → 检验层 → 具像化层：执行逻辑
+
+整体链路由 **Control 层**（`control_discussion.py`）驱动，数据按层传递并落盘。
+
+### 执行顺序概览
+
+```
+第一层（讨论层） → 第二层（实施步骤层） → [检验层] → 第三层（具像化层）
+     ↓                    ↓                    ↓              ↓
+  discuss/            implement/          （见 hierarchy）  concretization/
+```
+
+### 1. 第一层：讨论层
+
+- **入口**：`RoundtableDiscussion`（`roundtable/main.py`）
+- **步骤**：自主构思（论文检索 → `data/discussion_id/`）→ 学者分析（任务与角色）→ 创建领域专家与质疑者 → 多轮讨论（专家发言 → **第一层质疑**（web 检索 + 本地论文）→ **第二层质疑**（实施参数/指标/数据反馈）→ 专家修订两轮）→ 综合者整合 → 最终报告与共识
+- **输出**：发言与报告写入 `discussion/{discussion_id}/discuss/`，并生成第一层汇总文档/索引供第二层使用
+- **传给下游**：讨论状态、共识、行动建议、各轮发言等 → 转为 `DecisionOutput`（目标、任务、约束）作为第二层输入
+
+### 2. 第二层：实施步骤层
+
+- **入口**：`ImplementationDiscussion`（`hierarchy/layers/implementation_roundtable/`），由 `_run_implementation_layer()` 调用
+- **输入**：第一层的 `DecisionOutput` + 第一层汇总（按领域专家与质疑者发言）
+- **步骤**：与第一层领域专家**一一对应**创建实施步骤智能体 → 科学家分析 → 各领域专家根据第一层讨论与质疑者意见产出**可实施、可验证**的详细步骤 → 质疑→修订两轮 → 综合者整合实施计划
+- **输出**：实施方案与报告写入 `discussion/{discussion_id}/implement/`（含各领域最终修订稿，供第三层使用）
+
+### 3. 检验层（起什么作用）
+
+检验层对**决策层 + 实施层**的产出做**质量与逻辑评估**，并产出**奖励信号与改进建议**，用于闭环迭代或人工决策。
+
+- **定义位置**：`hierarchy/layers/validation_layer.py`（ValidationLayer），在 **HierarchicalOrchestrator**（`hierarchy/orchestrator.py`）中与决策层、实施层组成「决策 → 实施 → 检验」的强化学习闭环。
+- **圆桌主流程**：`control_discussion.py` 在**第二层之后**自动运行检验层，检验层输出保存到 **`discussion/discussion_id/inspect/`**（JSON + Markdown），再执行具像化层。执行顺序为「第一层 → 第二层 → 检验层 → 具像化层」。
+
+**检验层具体作用：**
+
+1. **单检验智能体：任务效果评估专家**  
+   检验层使用**一个**「任务效果评估专家」智能体（Role/Background/Profile/Goals/Constrains/Workflow/OutputFormat 见 `validation_layer.py` 内 `TASK_EFFECT_EVALUATION_PROMPT`），**使用长文本大模型**（`Config.llm_config.get_chat_long`，即 QWEN_MODEL_LONG）**一次性阅读所有第二层智能体角色输出的最终结果**，生成一份完整的评审/评估报告。
+
+2. **输入与输出**  
+   - **输入**：决策层输出 + 第二层各实施输出的全文（序列化后作为「当前待评估内容」拼入 prompt）。  
+   - **输出**：`ValidationOutput`，其中 `overall_assessment` 为评估报告全文；`scores`、`reward_signal` 等为兼容字段（可后续从报告中解析增强）。
+
+3. **反馈与闭环**  
+   - **奖励信号**（`reward_signal`）、**改进建议**（`suggestions`）、**是否升级**（`escalation_required`）仍存在，用于强化学习或人工决策。  
+   - 在 **HierarchicalOrchestrator** 中：若 `reward_signal` 达到阈值则结束；否则将检验层反馈并入下一轮查询，形成「决策 → 实施 → 检验 → 反馈 → 再决策」的闭环。
+
+### 4. 第三层：具像化层
+
+- **入口**：`ConcretizationDiscussion`（`hierarchy/layers/concretization_roundtable/`），由 `_run_concretization_layer()` 调用
+- **输入**：从 `discussion/{discussion_id}/implement/` 读取第二层产出的实施步骤（按领域/步骤）
+- **具像化含义**：具像化是通过**文字和数字**对任意对象进行**详细描述**的过程；若描述对象是**事物**，则该描述应足以**将该事物复现出来**。
+- **步骤**：按每条实施步骤创建**领域具像化智能体**（DomainConcretizationAgent）→ 执行**数字化 + 具像化**（数字/公式/量纲、文字与过程描述、模拟场景），并遵守第一性原理、物理守恒、材料约束等。每个领域具像化智能体**可使用网络工具**（由 control 注入 `web_search_fn`）查询**细节步骤**、或当**描述不够清晰时的理论/基础定义**，将检索结果纳入上下文后再生成可复现的详细描述。
+- **自动生成智能体 prompt**：领域具像化智能体的角色 prompt 参考 `concretization_roundtable/concretization_role_prompt_template.py` 中的**具象化评估智能体**样板（Role/Background/Attention/Profile/Skills/Goals/Constrains/Workflow/OutputFormat/Suggestions/Initialization）；按**领域**略作修改（如角色标题为「具象化评估智能体（{领域}领域）」、增加当前负责领域说明）。
+- **输出**：结果写入 `discussion/{discussion_id}/concretization/`（JSON + Markdown）
+- **具像化结果汇总智能体**：具像化层所有领域输出完成后自动创建，**阅读全部具像化结果**，使用**长文本大模型**生成汇总、去重、统一格式的任务文档，保存为 `concretization/concretization_summary_{timestamp}.md`。Prompt 参考 `concretization_roundtable/concretization_summary_prompt_template.py`（项目任务优化分析师）
+
+### 数据流与级联
+
+- **修改第一层发言**：会级联重跑第二层、再重跑具像化层
+- **修改第二层发言**：仅级联重跑具像化层
+- 第二层依赖第一层汇总文档与 `discussion_state`；具像化层仅依赖 `implement/` 目录下文件
 
 ## 🎨 用户体验
 

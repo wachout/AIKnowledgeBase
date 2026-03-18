@@ -487,7 +487,7 @@ class IntentRecognitionAgent:
 
         prompt = ChatPromptTemplate.from_template(
             """基于用户的意图分析，进行语义实体扩展，生成多个相关的搜索查询。
-
+            
 原始意图分析：
 - 主要意图：{main_intent}
 - 查询类型：{query_type}
@@ -580,7 +580,7 @@ class IntentRecognitionAgent:
         return self.search_obj.search_graph_data(param)
 
     def search_triple_engines_with_graph(self, state: IntentSearchState, query_text: str) -> List[Dict[str, Any]]:
-        """同时使用 Milvus、Elasticsearch 和图数据进行三引擎搜索
+        """同时使用 Milvus、Elasticsearch、图数据和CSV/Excel进行四引擎搜索
 
         Args:
             state: 智能体状态
@@ -590,21 +590,23 @@ class IntentRecognitionAgent:
             合并的搜索结果列表
         """
         try:
-            print("🔍 执行三引擎并行搜索（包含图数据）...")
+            print("🔍 执行四引擎并行搜索（Milvus + Elasticsearch + Graph + CSV/Excel）...")
 
-            # 使用 ThreadPoolExecutor 并行执行三个搜索引擎
-            with ThreadPoolExecutor(max_workers=3) as executor:
+            # 使用 ThreadPoolExecutor 并行执行四个搜索引擎
+            with ThreadPoolExecutor(max_workers=4) as executor:
                 milvus_future = executor.submit(self.search_milvus, state, query_text)
                 elastic_future = executor.submit(self.search_elasticsearch, state, query_text)
                 graph_future = executor.submit(self.search_graph_data, state, query_text)
+                csv_excel_future = executor.submit(self.search_csv_excel_data, state, query_text)
 
                 # 等待结果
                 milvus_results = milvus_future.result()
                 elastic_results = elastic_future.result()
                 graph_results = graph_future.result()
+                csv_excel_results = csv_excel_future.result()
 
             # 合并结果
-            combined_results = milvus_results + elastic_results + graph_results
+            combined_results = milvus_results + elastic_results + graph_results + csv_excel_results
 
             # 统一得分处理
             for result in combined_results:
@@ -612,6 +614,8 @@ class IntentRecognitionAgent:
                     result["combined_score"] = result.get("_score", 0) * 10  # 文本搜索权重最高
                 elif result.get("search_engine") == "graph_data":
                     result["combined_score"] = result.get("score", 0) * 12  # 图数据权重最高，因为包含关系信息
+                elif result.get("search_engine") == "csv_excel":
+                    result["combined_score"] = result.get("score", 0) * 15  # CSV/Excel表格数据权重最高
                 else:
                     result["combined_score"] = result.get("score", 0)  # Milvus保持原权重
 
@@ -619,31 +623,36 @@ class IntentRecognitionAgent:
             combined_results.sort(key=lambda x: x.get("combined_score", 0), reverse=True)
 
             # 限制结果数量
-            max_results = 10  # 增加结果数量以适应三引擎
+            max_results = 15  # 增加结果数量以适应四引擎
             combined_results = combined_results[:max_results]
 
-            print(f"✅ 三引擎搜索完成，获得 {len(combined_results)} 个结果")
+            print(f"✅ 四引擎搜索完成，获得 {len(combined_results)} 个结果")
             print(f"   - Milvus: {len(milvus_results)} 个结果")
             print(f"   - Elasticsearch: {len(elastic_results)} 个结果")
             print(f"   - 图数据: {len(graph_results)} 个结果")
+            print(f"   - CSV/Excel: {len(csv_excel_results)} 个结果")
 
             return combined_results
 
         except Exception as e:
-            print(f"❌ 三引擎搜索失败: {e}，回退到双引擎搜索")
-            # 回退到双引擎搜索
+            print(f"❌ 四引擎搜索失败: {e}，回退到三引擎搜索")
+            # 回退到三引擎搜索
             try:
-                with ThreadPoolExecutor(max_workers=2) as executor:
+                with ThreadPoolExecutor(max_workers=3) as executor:
                     milvus_future = executor.submit(self.search_milvus, state, query_text)
                     elastic_future = executor.submit(self.search_elasticsearch, state, query_text)
+                    graph_future = executor.submit(self.search_graph_data, state, query_text)
 
                     milvus_results = milvus_future.result()
                     elastic_results = elastic_future.result()
+                    graph_results = graph_future.result()
 
-                combined_results = milvus_results + elastic_results
+                combined_results = milvus_results + elastic_results + graph_results
                 for result in combined_results:
                     if result.get("search_engine") == "elasticsearch":
                         result["combined_score"] = result.get("_score", 0) * 10
+                    elif result.get("search_engine") == "graph_data":
+                        result["combined_score"] = result.get("score", 0) * 12
                     else:
                         result["combined_score"] = result.get("score", 0)
 
@@ -653,6 +662,609 @@ class IntentRecognitionAgent:
             except Exception as fallback_e:
                 print(f"❌ 回退搜索也失败: {fallback_e}，使用Milvus单引擎")
                 return self.search_milvus(state, query_text)
+
+    def search_csv_excel_data(self, state: IntentSearchState, query_text: str) -> List[Dict[str, Any]]:
+        """在CSV/Excel表格数据中进行智能问数查询（第四数据源）
+        
+        通过智能问数智能体流程：
+        1. 查找 file/file_id 目录下的目录文件（_catalog.md）和 SQLite 数据库（_data.db）
+        2. 意图分析智能体：分析用户问题 + 目录内容，找到对应的 SQLite 表
+        3. SQL 生成智能体：根据列描述生成 SQL、语法检查、校验、修改
+        4. 运行 SQL 查询
+        5. 数据分析智能体：对文本数据统计，对数值数据基础分析
+
+        Args:
+            state: 智能体状态
+            query_text: 搜索查询文本
+
+        Returns:
+            CSV/Excel搜索结果列表，包含表格数据和分析结果
+        """
+        import os
+        from pathlib import Path
+        
+        results = []
+        
+        try:
+            knowledge_id = state.get("knowledge_id", "")
+            if not knowledge_id:
+                return results
+            
+            # 获取知识库下的所有文件
+            files = cSingleSqlite.search_file_by_knowledge_id(knowledge_id)
+            if not files:
+                return results
+            
+            processed_files = set()
+            
+            for file_info in files:
+                file_id = file_info.get("file_id", "")
+                file_name = file_info.get("file_name", "")
+                
+                if not file_id or file_id in processed_files:
+                    continue
+                
+                # 检查文件类型
+                file_ext = Path(file_name).suffix.lower() if file_name else ""
+                if file_ext not in [".csv", ".xlsx", ".xls"]:
+                    continue
+                
+                processed_files.add(file_id)
+                
+                # 构建文件目录路径
+                file_dir = os.path.join("conf", "file", file_id)
+                if not os.path.exists(file_dir):
+                    continue
+                
+                # 使用智能问数智能体进行查询
+                smart_query_result = self._smart_table_query(file_dir, file_id, file_name, query_text)
+                if smart_query_result:
+                    results.append(smart_query_result)
+            
+            print(f"📊 智能问数查询完成: {len(results)} 个结果")
+            
+        except Exception as e:
+            print(f"⚠️ 智能问数查询失败: {e}")
+            
+        return results
+    
+    def _smart_table_query(self, file_dir: str, file_id: str, file_name: str, query: str) -> Optional[Dict[str, Any]]:
+        """智能问数智能体主流程
+        
+        Args:
+            file_dir: 文件目录路径（file/file_id）
+            file_id: 文件ID
+            file_name: 文件名
+            query: 用户查询问题
+            
+        Returns:
+            智能问数结果，包含SQL查询结果和数据分析
+        """
+        import os
+        import glob
+        
+        try:
+            # 步骤1: 查找目录文件和 SQLite 数据库
+            catalog_files = glob.glob(os.path.join(file_dir, "*_catalog.md"))
+            sqlite_files = glob.glob(os.path.join(file_dir, "*_data.db"))
+            
+            if not sqlite_files:
+                print(f"⚠️ 未找到 SQLite 数据库: {file_dir}")
+                return None
+            
+            sqlite_path = sqlite_files[0]  # 使用第一个找到的数据库
+            
+            # 读取目录文件内容（用于意图分析）
+            catalog_content = ""
+            if catalog_files:
+                try:
+                    with open(catalog_files[0], "r", encoding="utf-8") as f:
+                        catalog_content = f.read()
+                except Exception:
+                    pass
+            
+            # 步骤2: 意图分析智能体 - 分析用户问题，找到对应表
+            intent_result = self._analyze_table_intent(sqlite_path, catalog_content, query)
+            if not intent_result:
+                return None
+            
+            target_table = intent_result.get("target_table", "")
+            column_descriptions = intent_result.get("column_descriptions", [])
+            
+            # 步骤3: SQL 生成智能体 - 生成、检查、校验 SQL
+            sql_result = self._generate_and_validate_sql(
+                sqlite_path, target_table, column_descriptions, query
+            )
+            if not sql_result or not sql_result.get("sql"):
+                return None
+            
+            # 步骤4: 运行 SQL 查询
+            query_result = self._execute_sql_query(sqlite_path, sql_result.get("sql"))
+            if not query_result:
+                return None
+            
+            # 步骤5: 数据分析智能体 - 对结果进行分析
+            analysis_result = self._analyze_query_result(query_result, query)
+            
+            # 构建最终结果
+            result = {
+                "title": f"📊 智能问数: {file_name}",
+                "content": analysis_result.get("summary", ""),
+                "score": 15,  # 高权重
+                "source": sqlite_path,
+                "search_engine": "smart_table_query",
+                "file_id": file_id,
+                "file_name": file_name,
+                "is_table_data": True,
+                "table_data": {
+                    "headers": query_result.get("headers", []),
+                    "rows": query_result.get("rows", []),
+                    "total_rows": len(query_result.get("rows", [])),
+                    "total_columns": len(query_result.get("headers", [])),
+                    "markdown_table": self._generate_markdown_table(
+                        query_result.get("headers", []),
+                        query_result.get("rows", [])
+                    )
+                },
+                "metadata": {
+                    "analysis_type": "smart_table_query",
+                    "query": query,
+                    "target_table": target_table,
+                    "generated_sql": sql_result.get("sql", ""),
+                    "intent_analysis": intent_result,
+                    "data_analysis": analysis_result
+                }
+            }
+            
+            return result
+            
+        except Exception as e:
+            print(f"⚠️ 智能问数失败 ({file_name}): {e}")
+            return None
+    
+    def _analyze_table_intent(self, sqlite_path: str, catalog_content: str, query: str) -> Optional[Dict[str, Any]]:
+        """意图分析智能体：分析用户问题，找到对应的 SQLite 表
+        
+        Args:
+            sqlite_path: SQLite 数据库路径
+            catalog_content: 目录文件内容
+            query: 用户查询问题
+            
+        Returns:
+            意图分析结果，包含目标表和列描述
+        """
+        import sqlite3
+        import json
+        
+        try:
+            conn = sqlite3.connect(sqlite_path)
+            cursor = conn.cursor()
+            
+            # 获取所有表的元数据
+            cursor.execute("SELECT table_name, sheet_name, description FROM _table_metadata")
+            tables = cursor.fetchall()
+            
+            # 获取所有列的元数据
+            cursor.execute("SELECT table_name, column_name, description, sample_values FROM _column_metadata")
+            columns = cursor.fetchall()
+            
+            conn.close()
+            
+            if not tables:
+                return None
+            
+            # 构建表和列信息
+            table_info = {}
+            for table_name, sheet_name, description in tables:
+                table_info[table_name] = {
+                    "sheet_name": sheet_name,
+                    "description": description,
+                    "columns": []
+                }
+            
+            for table_name, column_name, description, sample_values in columns:
+                if table_name in table_info:
+                    table_info[table_name]["columns"].append({
+                        "name": column_name,
+                        "description": description,
+                        "sample_values": sample_values
+                    })
+            
+            # 使用 LLM 进行意图分析
+            from Config.llm_config import get_chat_tongyi
+            
+            llm = get_chat_tongyi(temperature=0.1, streaming=False, enable_thinking=False)
+            
+            prompt = f"""你是一个数据分析意图识别专家。根据用户的问题和可用的表格信息，分析用户想查询哪个表。
+
+## 用户问题
+{query}
+
+## 可用表格信息
+{json.dumps(table_info, ensure_ascii=False, indent=2)}
+
+## 目录信息（如有）
+{catalog_content if catalog_content else "无"}
+
+## 输出要求
+请分析用户意图，返回 JSON 格式：
+```json
+{{
+    "target_table": "最相关的表名",
+    "confidence": 0.9,
+    "reason": "选择该表的原因",
+    "relevant_columns": ["与查询相关的列名列表"]
+}}
+```
+
+只返回 JSON，不要其他内容。"""
+
+            response = llm.invoke(prompt)
+            response_text = response.content if hasattr(response, 'content') else str(response)
+            
+            # 解析 JSON 响应
+            import re
+            json_match = re.search(r'\{[^{}]*\}', response_text, re.DOTALL)
+            if json_match:
+                intent_data = json.loads(json_match.group())
+                target_table = intent_data.get("target_table", "")
+                
+                if target_table and target_table in table_info:
+                    return {
+                        "target_table": target_table,
+                        "confidence": intent_data.get("confidence", 0.5),
+                        "reason": intent_data.get("reason", ""),
+                        "relevant_columns": intent_data.get("relevant_columns", []),
+                        "column_descriptions": table_info[target_table]["columns"]
+                    }
+            
+            # 如果 LLM 分析失败，使用第一个表
+            first_table = list(table_info.keys())[0]
+            return {
+                "target_table": first_table,
+                "confidence": 0.3,
+                "reason": "默认选择第一个表",
+                "relevant_columns": [],
+                "column_descriptions": table_info[first_table]["columns"]
+            }
+            
+        except Exception as e:
+            print(f"⚠️ 意图分析失败: {e}")
+            return None
+    
+    def _generate_and_validate_sql(self, sqlite_path: str, table_name: str, 
+                                    column_descriptions: List[Dict], query: str) -> Optional[Dict[str, Any]]:
+        """SQL 生成智能体：生成 SQL、语法检查、校验、修改
+        
+        Args:
+            sqlite_path: SQLite 数据库路径
+            table_name: 目标表名
+            column_descriptions: 列描述信息
+            query: 用户查询问题
+            
+        Returns:
+            SQL 生成结果，包含最终 SQL 语句
+        """
+        import sqlite3
+        import json
+        
+        try:
+            from Config.llm_config import get_chat_tongyi
+            
+            llm = get_chat_tongyi(temperature=0.1, streaming=False, enable_thinking=False)
+            
+            # 构建列信息
+            columns_info = "\n".join([
+                f"- {col['name']}: {col.get('description', '无描述')}"
+                for col in column_descriptions
+            ])
+            
+            prompt = f"""你是一个 SQLite SQL 生成专家。根据用户问题生成 SQL 查询语句。
+
+## 用户问题
+{query}
+
+## 目标表
+表名: {table_name}
+
+## 列信息
+{columns_info}
+
+## 要求
+1. 生成符合 SQLite 语法的 SQL
+2. 只返回 SELECT 查询语句，禁止 INSERT/UPDATE/DELETE
+3. 如果是统计类问题，使用 COUNT/SUM/AVG/MAX/MIN 等聚合函数
+4. 如果是筛选问题，使用 WHERE 条件
+5. 限制返回行数不超过 100 行（使用 LIMIT）
+
+## 输出格式
+```json
+{{
+    "sql": "SELECT ... FROM {table_name} ...",
+    "explanation": "SQL 解释"
+}}
+```
+
+只返回 JSON，不要其他内容。"""
+
+            response = llm.invoke(prompt)
+            response_text = response.content if hasattr(response, 'content') else str(response)
+            
+            # 解析 JSON 响应
+            import re
+            json_match = re.search(r'\{[^{}]*\}', response_text, re.DOTALL)
+            if json_match:
+                sql_data = json.loads(json_match.group())
+                sql = sql_data.get("sql", "")
+                
+                if sql:
+                    # 语法检查和校验
+                    validated_sql = self._validate_sql(sqlite_path, sql, table_name)
+                    if validated_sql:
+                        return {
+                            "sql": validated_sql,
+                            "original_sql": sql,
+                            "explanation": sql_data.get("explanation", ""),
+                            "validated": True
+                        }
+            
+            # 如果生成失败，返回简单的全表查询
+            fallback_sql = f'SELECT * FROM "{table_name}" LIMIT 50'
+            return {
+                "sql": fallback_sql,
+                "original_sql": fallback_sql,
+                "explanation": "使用默认全表查询",
+                "validated": False
+            }
+            
+        except Exception as e:
+            print(f"⚠️ SQL 生成失败: {e}")
+            return None
+    
+    def _validate_sql(self, sqlite_path: str, sql: str, table_name: str) -> Optional[str]:
+        """校验和修正 SQL 语句
+        
+        Args:
+            sqlite_path: SQLite 数据库路径
+            sql: 待校验的 SQL
+            table_name: 目标表名
+            
+        Returns:
+            校验后的 SQL，失败返回 None
+        """
+        import sqlite3
+        
+        try:
+            # 安全检查：只允许 SELECT
+            sql_upper = sql.upper().strip()
+            if not sql_upper.startswith("SELECT"):
+                return None
+            
+            # 禁止危险操作
+            dangerous_keywords = ["DROP", "DELETE", "INSERT", "UPDATE", "ALTER", "CREATE", "TRUNCATE"]
+            for keyword in dangerous_keywords:
+                if keyword in sql_upper:
+                    return None
+            
+            # 确保有 LIMIT 限制
+            if "LIMIT" not in sql_upper:
+                sql = sql.rstrip(";") + " LIMIT 100"
+            
+            # 尝试执行 EXPLAIN 检查语法
+            conn = sqlite3.connect(sqlite_path)
+            cursor = conn.cursor()
+            
+            try:
+                cursor.execute(f"EXPLAIN {sql}")
+                conn.close()
+                return sql
+            except sqlite3.OperationalError as e:
+                conn.close()
+                print(f"⚠️ SQL 语法错误: {e}")
+                # 返回简单的全表查询作为回退
+                return f'SELECT * FROM "{table_name}" LIMIT 50'
+                
+        except Exception as e:
+            print(f"⚠️ SQL 校验失败: {e}")
+            return None
+    
+    def _execute_sql_query(self, sqlite_path: str, sql: str) -> Optional[Dict[str, Any]]:
+        """执行 SQL 查询
+        
+        Args:
+            sqlite_path: SQLite 数据库路径
+            sql: SQL 查询语句
+            
+        Returns:
+            查询结果，包含 headers 和 rows
+        """
+        import sqlite3
+        
+        try:
+            conn = sqlite3.connect(sqlite_path)
+            cursor = conn.cursor()
+            
+            cursor.execute(sql)
+            
+            # 获取列名
+            headers = [description[0] for description in cursor.description]
+            
+            # 获取数据
+            rows = cursor.fetchall()
+            
+            conn.close()
+            
+            # 转换为字符串列表
+            rows = [[str(cell) if cell is not None else "" for cell in row] for row in rows]
+            
+            return {
+                "headers": headers,
+                "rows": rows,
+                "row_count": len(rows),
+                "sql": sql
+            }
+            
+        except Exception as e:
+            print(f"⚠️ SQL 执行失败: {e}")
+            return None
+    
+    def _analyze_query_result(self, query_result: Dict[str, Any], original_query: str) -> Dict[str, Any]:
+        """数据分析智能体：对查询结果进行分析
+        
+        对文本数据进行统计，对数值数据进行基础分析。
+        
+        Args:
+            query_result: SQL 查询结果
+            original_query: 原始用户查询
+            
+        Returns:
+            分析结果
+        """
+        try:
+            headers = query_result.get("headers", [])
+            rows = query_result.get("rows", [])
+            
+            if not headers or not rows:
+                return {"summary": "查询结果为空", "statistics": {}}
+            
+            analysis = {
+                "summary": "",
+                "statistics": {},
+                "text_analysis": {},
+                "numeric_analysis": {}
+            }
+            
+            # 对每列进行分析
+            for col_idx, header in enumerate(headers):
+                col_values = [row[col_idx] for row in rows if col_idx < len(row)]
+                
+                # 尝试转换为数值
+                numeric_values = []
+                text_values = []
+                
+                for val in col_values:
+                    if val and val != "":
+                        try:
+                            numeric_values.append(float(val))
+                        except ValueError:
+                            text_values.append(str(val))
+                
+                # 数值列分析
+                if numeric_values and len(numeric_values) > len(text_values):
+                    analysis["numeric_analysis"][header] = {
+                        "count": len(numeric_values),
+                        "sum": round(sum(numeric_values), 2),
+                        "avg": round(sum(numeric_values) / len(numeric_values), 2),
+                        "min": round(min(numeric_values), 2),
+                        "max": round(max(numeric_values), 2)
+                    }
+                # 文本列分析
+                elif text_values:
+                    value_counts = {}
+                    for v in text_values:
+                        value_counts[v] = value_counts.get(v, 0) + 1
+                    
+                    # 取前5个最常见的值
+                    top_values = sorted(value_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+                    
+                    analysis["text_analysis"][header] = {
+                        "unique_count": len(value_counts),
+                        "total_count": len(text_values),
+                        "top_values": dict(top_values)
+                    }
+            
+            # 生成摘要
+            summary_parts = [f"查询返回 {len(rows)} 行数据"]
+            
+            if analysis["numeric_analysis"]:
+                for col, stats in analysis["numeric_analysis"].items():
+                    summary_parts.append(f"{col}: 平均值={stats['avg']}, 总和={stats['sum']}, 范围=[{stats['min']}, {stats['max']}]")
+            
+            if analysis["text_analysis"]:
+                for col, stats in analysis["text_analysis"].items():
+                    summary_parts.append(f"{col}: {stats['unique_count']}个唯一值")
+            
+            analysis["summary"] = "；".join(summary_parts)
+            analysis["statistics"] = {
+                "row_count": len(rows),
+                "column_count": len(headers)
+            }
+            
+            return analysis
+            
+        except Exception as e:
+            print(f"⚠️ 数据分析失败: {e}")
+            return {"summary": f"数据分析出错: {e}", "statistics": {}}
+    
+    def _read_csv_as_table(self, csv_path: str, max_rows: int = 20) -> Dict[str, Any]:
+        """读取CSV文件为表格格式数据
+        
+        Args:
+            csv_path: CSV文件路径
+            max_rows: 最大读取行数
+            
+        Returns:
+            表格数据字典，包含headers和rows
+        """
+        try:
+            import pandas as pd
+            
+            df = pd.read_csv(csv_path, nrows=max_rows, encoding="utf-8-sig")
+            
+            # 转换为表格格式
+            headers = df.columns.tolist()
+            rows = df.values.tolist()
+            
+            # 处理NaN值
+            rows = [[("" if pd.isna(cell) else str(cell)) for cell in row] for row in rows]
+            
+            # 生成Markdown表格
+            markdown_table = self._generate_markdown_table(headers, rows)
+            
+            return {
+                "headers": headers,
+                "rows": rows,
+                "total_rows": len(rows),
+                "total_columns": len(headers),
+                "markdown_table": markdown_table
+            }
+            
+        except Exception as e:
+            print(f"⚠️ 读取CSV表格失败: {e}")
+            return {"headers": [], "rows": [], "total_rows": 0, "total_columns": 0, "markdown_table": ""}
+    
+    def _generate_markdown_table(self, headers: List[str], rows: List[List[str]], max_rows: int = 10) -> str:
+        """生成Markdown格式的表格
+        
+        Args:
+            headers: 表头列表
+            rows: 数据行列表
+            max_rows: 最大显示行数
+            
+        Returns:
+            Markdown格式的表格字符串
+        """
+        if not headers:
+            return ""
+        
+        lines = []
+        
+        # 表头
+        lines.append("| " + " | ".join(str(h) for h in headers) + " |")
+        # 分隔线
+        lines.append("| " + " | ".join("---" for _ in headers) + " |")
+        # 数据行（限制显示行数）
+        display_rows = rows[:max_rows]
+        for row in display_rows:
+            # 确保每行的列数与表头一致
+            padded_row = row + [""] * (len(headers) - len(row)) if len(row) < len(headers) else row[:len(headers)]
+            lines.append("| " + " | ".join(str(cell) for cell in padded_row) + " |")
+        
+        # 如果有更多行，添加提示
+        if len(rows) > max_rows:
+            lines.append(f"\n*（共 {len(rows)} 行数据，仅显示前 {max_rows} 行）*")
+        
+        return "\n".join(lines)
 
     def merge_search_results(self, results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """合并和去重搜索结果
@@ -732,8 +1344,8 @@ class IntentRecognitionAgent:
                 }
                 state["intent_analysis"] = intent_analysis
 
-            # 步骤2: 基于意图进行初始三引擎搜索（包含图数据）
-            print("🔎 步骤2: 执行初始三引擎搜索（Milvus + Elasticsearch + Graph）")
+            # 步骤2: 基于意图进行初始四引擎搜索（Milvus + Elasticsearch + Graph + CSV/Excel）
+            print("🔎 步骤2: 执行初始四引擎搜索（Milvus + Elasticsearch + Graph + CSV/Excel）")
             # 如果提供了意图识别结果，优先使用语义提纯后的查询
             search_query = query
             if intent_result:

@@ -1,13 +1,13 @@
 """
 多层强化学习智能体系统 (Hierarchical Reinforcement Learning Agent System)
 
-圆桌讨论系统为两层架构：
+圆桌讨论系统为三层架构：
 - 第一层（讨论层）：圆桌讨论与战略决策，形成共识与可执行方案
-- 第二层（实施与专业领域知识划分层）：按知识领域划分专家，细化实施步骤，各领域专家产出详细方案并保存至 discussion/discussion_id/pro
+- 第二层（实施与专业领域知识划分层）：按知识领域划分专家，细化实施步骤，各领域专家产出详细方案
+- 第三层（具象化层）：阅读实施步骤，按领域具象化（数字化+具象化）
 
 系统特点：
 - 层次化强化学习：每层都有自己的状态、动作空间和奖励函数
-- 反馈回路：检验层的结果反馈给决策层，形成强化学习闭环
 - 动态智能体：根据任务类型动态创建和配置智能体
 - 经验复用：支持经验回放和策略迁移
 """
@@ -20,7 +20,6 @@ from .types import (
     ExecutionStatus,
     AgentAction,
     ImplementationRole,
-    ValidationRole,
     MessageType,
     IssueSeverity,
     # 数据类
@@ -36,7 +35,6 @@ from .types import (
     # 层输出
     DecisionOutput,
     ImplementationOutput,
-    ValidationOutput,
     HierarchicalOutput,
     # 状态
     AgentState,
@@ -62,7 +60,6 @@ from .layers import (
     LayerConfig,
     DecisionLayer,
     ImplementationLayer,
-    ValidationLayer
 )
 
 # 智能体
@@ -79,13 +76,7 @@ from .agents import (
     DeveloperAgent,
     TesterAgent,
     DocumenterAgent,
-    CoordinatorAgent,
-    # 检验层智能体
-    QualityInspectorAgent,
-    LogicValidatorAgent,
-    PerformanceAnalystAgent,
-    SecurityAuditorAgent,
-    ComplianceCheckerAgent
+    CoordinatorAgent
 )
 
 # 强化学习组件
@@ -119,7 +110,6 @@ __all__ = [
     'ExecutionStatus',
     'AgentAction',
     'ImplementationRole',
-    'ValidationRole',
     'MessageType',
     'IssueSeverity',
     'Objective',
@@ -133,7 +123,6 @@ __all__ = [
     'ExecutionMetric',
     'DecisionOutput',
     'ImplementationOutput',
-    'ValidationOutput',
     'HierarchicalOutput',
     'AgentState',
     'AgentMemory',
@@ -153,7 +142,6 @@ __all__ = [
     'LayerConfig',
     'DecisionLayer',
     'ImplementationLayer',
-    'ValidationLayer',
     
     # === 智能体 ===
     'BaseHierarchicalAgent',
@@ -167,11 +155,6 @@ __all__ = [
     'TesterAgent',
     'DocumenterAgent',
     'CoordinatorAgent',
-    'QualityInspectorAgent',
-    'LogicValidatorAgent',
-    'PerformanceAnalystAgent',
-    'SecurityAuditorAgent',
-    'ComplianceCheckerAgent',
     
     # === 强化学习 ===
     'RLGraph',

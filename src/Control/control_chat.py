@@ -3,6 +3,7 @@
 import os
 import re
 import json
+import shutil
 import csv
 import time
 import logging
@@ -435,6 +436,7 @@ class CControl():
 - 🚀 **创建新任务**: "帮我分析XX问题" / "讨论XX主题"
 - 📊 **查询任务状态**: "任务进度怎么样" / "查看最新任务"
 - 🔍 **查询指定任务**: "查询 discussion_xxx 的情况"
+- 🗑️ **删除任务**: "删除任务 discussion_xxx" / "删掉 discussion_xxx"
 
 如果您想进行普通对话，请使用其他聊天模式。
 """,
@@ -477,6 +479,35 @@ class CControl():
                 )
             except Exception as e:
                 logger.error(f"修改发言执行失败: {e}", exc_info=True)
+            return
+
+        # 意图6：删除指定任务（需单个任务ID，删除该任务所有相关信息及 discussion/discussion_id 下所有文件）
+        if user_intent == 'delete_task':
+            if not target_discussion_id:
+                yield self._create_chunk(_id,
+                    content="❌ 删除任务需要指定任务ID。请说明要删除的任务，例如：删除任务 discussion_xxx\n",
+                    chunk_type="text", finish_reason=""
+                )
+                yield self._create_chunk(_id, content="", chunk_type="text", finish_reason="stop")
+                return
+            try:
+                discussion_path = os.path.join("discussion", target_discussion_id)
+                if os.path.exists(discussion_path) and os.path.isdir(discussion_path):
+                    shutil.rmtree(discussion_path)
+                    logger.info(f"删除圆桌讨论文件夹成功: {discussion_path}")
+                cSingleSqlite.delete_discussion_task_by_discussion_id(target_discussion_id)
+                logger.info(f"删除圆桌讨论任务记录成功: discussion_id={target_discussion_id}")
+                yield self._create_chunk(_id,
+                    content=f"✅ 已删除任务 `{target_discussion_id}`：已移除该任务在数据库中的记录，并已删除 discussion/{target_discussion_id} 下的所有文件。\n",
+                    chunk_type="text", finish_reason=""
+                )
+            except Exception as e:
+                logger.error(f"删除任务失败: {e}", exc_info=True)
+                yield self._create_chunk(_id,
+                    content=f"❌ 删除任务时出错: {e}\n",
+                    chunk_type="text", finish_reason=""
+                )
+            yield self._create_chunk(_id, content="", chunk_type="text", finish_reason="stop")
             return
         
         # 意图4：创建新任务 或 恢复/重启已有任务（resume 或 start_new 且带任务ID时用原ID）
@@ -603,9 +634,13 @@ class CControl():
    - 用户指定了任务ID，并要求修改该任务中某一角色/智能体的发言内容
    - 例如："修改 discussion_xxx 里 专家_人机交互 的发言"、"把 discussion_abc 中 人机交互 的发言改成：..."、"修改任务 discussion_xxx 中 第二层 工业设计 的发言"
 
+7. **delete_task** - 删除指定任务
+   - 用户明确要求删除某个任务，且输入中带有**单个**任务ID（discussion_xxx）
+   - 例如："删除任务 discussion_abc123"、"删掉 discussion_xxx"、"删除 discussion_40cd045d"、"把 discussion_xxx 删了"
+
 **请以JSON格式返回：**
 {{
-    "intent": "start_new|query_latest|query_specific|resume|other_chat|modify_speech",
+    "intent": "start_new|query_latest|query_specific|resume|other_chat|modify_speech|delete_task",
     "confidence": 0.0-1.0,
     "reasoning": "简要判断理由",
     "speaker": "当 intent 为 modify_speech 时，从用户输入中识别的智能体名称，如 专家_人机交互、人机交互、工业设计 等，否则填空字符串",
@@ -632,11 +667,15 @@ class CControl():
                     logger.info(f"🧠 意图识别智能体: intent={intent}, confidence={confidence}, reasoning={reasoning[:50]}")
                     
                     # 验证intent值
-                    valid_intents = ['start_new', 'query_latest', 'query_specific', 'resume', 'other_chat', 'modify_speech']
+                    valid_intents = ['start_new', 'query_latest', 'query_specific', 'resume', 'other_chat', 'modify_speech', 'delete_task']
                     if intent not in valid_intents:
                         intent = 'start_new'
                     
                     result = {'intent': intent, 'discussion_id': extracted_id}
+                    if intent == 'delete_task' and not extracted_id:
+                        # 删除任务必须带单个任务ID，否则视为其他
+                        result['intent'] = 'other_chat'
+                        result['discussion_id'] = None
                     if intent == 'modify_speech':
                         result['speaker'] = intent_result.get('speaker', '') or ''
                         result['layer'] = int(intent_result.get('layer', 0)) if str(intent_result.get('layer', '')).isdigit() else 0
@@ -658,6 +697,10 @@ class CControl():
         """
         query_lower = query.lower().strip()
         
+        # 若有任务ID且用户说删除，则视为删除任务
+        delete_keywords = ['删除任务', '删除', '删掉', '删了', '移除', 'remove', 'delete', '清除']
+        if extracted_id and any(kw in query_lower for kw in delete_keywords):
+            return {'intent': 'delete_task', 'discussion_id': extracted_id}
         # 若有任务ID且用户说继续/重启，则视为恢复指定任务（用原ID）
         resume_keywords = ['继续', '重启', '恢复', '接着', 'resume', 'restart', '继续运行']
         if extracted_id and any(kw in query_lower for kw in resume_keywords):

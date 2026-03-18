@@ -12,9 +12,9 @@ import uuid
 
 from .types import (
     LayerType, HierarchicalOutput, DecisionOutput, ImplementationOutput,
-    ValidationOutput, GlobalState, Experience
+    GlobalState, Experience
 )
-from .layers import DecisionLayer, ImplementationLayer, ValidationLayer
+from .layers import DecisionLayer, ImplementationLayer
 from .layers.base_layer import LayerContext
 from .rl_graph import RLGraph
 from .communication import CommunicationCoordinator
@@ -61,7 +61,6 @@ class HierarchicalOrchestrator:
         # 三层架构
         self.decision_layer = DecisionLayer(llm_adapter=llm_adapter)
         self.implementation_layer = ImplementationLayer(llm_adapter=llm_adapter)
-        self.validation_layer = ValidationLayer(llm_adapter=llm_adapter)
         
         # 强化学习组件
         self.rl_graph = RLGraph()
@@ -107,7 +106,6 @@ class HierarchicalOrchestrator:
         iteration = 0
         decision_output = None
         impl_outputs = []
-        validation_output = None
         
         try:
             while iteration < self.config.max_iterations:
@@ -118,7 +116,7 @@ class HierarchicalOrchestrator:
                     session_id=self._global_state.session_id,
                     iteration=iteration,
                     query=query,
-                    feedback=validation_output.to_dict() if validation_output else None
+                    feedback=None
                 )
                 
                 decision_output = await self.decision_layer.process(decision_context)
@@ -136,20 +134,9 @@ class HierarchicalOrchestrator:
                 for output in impl_outputs:
                     self.trajectory_recorder.record_implementation(output)
                 
-                # === 第三层：检验 ===
-                val_context = LayerContext(
-                    session_id=self._global_state.session_id,
-                    iteration=iteration,
-                    query=query,
-                    parent_output=(decision_output, impl_outputs)
-                )
-                
-                validation_output = await self.validation_layer.process(val_context)
-                self.trajectory_recorder.record_validation(validation_output)
-                
                 # === 计算奖励 ===
                 reward = self.reward_system.compute_total_reward(
-                    decision_output, impl_outputs, validation_output
+                    decision_output, impl_outputs, None
                 )
                 self._global_state.reward_history.append(reward)
                 self._global_state.total_reward = reward
@@ -157,7 +144,7 @@ class HierarchicalOrchestrator:
                 # === 收集经验并更新策略 ===
                 if self.config.enable_learning:
                     experiences = self._collect_experiences(
-                        decision_output, impl_outputs, validation_output, reward
+                        decision_output, impl_outputs, reward
                     )
                     self.experience_buffer.add_batch(experiences)
                     
@@ -167,18 +154,15 @@ class HierarchicalOrchestrator:
                         self.policy_updater.update(batch)
                 
                 # === 检查退出条件 ===
-                if validation_output.reward_signal >= self.config.reward_threshold:
+                if reward >= self.config.reward_threshold:
                     self._logger.info(f"迭代 {iteration}: 达到奖励阈值，提前结束")
                     break
                 
-                # === 根据反馈调整 ===
-                query = self._incorporate_feedback(query, validation_output)
                 iteration += 1
             
             # 结束轨迹
             trajectory = self.trajectory_recorder.end_trajectory(
-                success=validation_output.reward_signal >= self.config.reward_threshold
-                        if validation_output else False
+                success=reward >= self.config.reward_threshold
             )
             
             # 编译最终输出
@@ -189,15 +173,12 @@ class HierarchicalOrchestrator:
                 query=query,
                 decision_output=decision_output,
                 implementation_outputs=impl_outputs,
-                validation_output=validation_output,
+                validation_output=None,
                 total_iterations=iteration + 1,
                 final_reward=self._global_state.total_reward,
                 execution_time_seconds=execution_time,
-                success=validation_output.reward_signal >= self.config.reward_threshold
-                        if validation_output else False,
-                summary=self._generate_summary(
-                    decision_output, impl_outputs, validation_output
-                )
+                success=reward >= self.config.reward_threshold,
+                summary=self._generate_summary(decision_output, impl_outputs)
             )
             
         except Exception as e:
@@ -236,7 +217,6 @@ class HierarchicalOrchestrator:
         iteration = 0
         decision_output = None
         impl_outputs = []
-        validation_output = None
         
         try:
             while iteration < self.config.max_iterations:
@@ -251,7 +231,7 @@ class HierarchicalOrchestrator:
                     session_id=self._global_state.session_id,
                     iteration=iteration,
                     query=query,
-                    feedback=validation_output.to_dict() if validation_output else None
+                    feedback=None
                 )
                 
                 async for chunk in self.decision_layer.process_stream(decision_context):
@@ -276,24 +256,9 @@ class HierarchicalOrchestrator:
                 for output in impl_outputs:
                     self.trajectory_recorder.record_implementation(output)
                 
-                # === 第三层：检验 ===
-                yield "\n[协调器] 【第三层：检验层】\n"
-                val_context = LayerContext(
-                    session_id=self._global_state.session_id,
-                    iteration=iteration,
-                    query=query,
-                    parent_output=(decision_output, impl_outputs)
-                )
-                
-                async for chunk in self.validation_layer.process_stream(val_context):
-                    yield chunk
-                
-                validation_output = await self.validation_layer.process(val_context)
-                self.trajectory_recorder.record_validation(validation_output)
-                
                 # === 计算奖励 ===
                 reward = self.reward_system.compute_total_reward(
-                    decision_output, impl_outputs, validation_output
+                    decision_output, impl_outputs, None
                 )
                 self._global_state.reward_history.append(reward)
                 self._global_state.total_reward = reward
@@ -303,7 +268,7 @@ class HierarchicalOrchestrator:
                 # === 策略更新 ===
                 if self.config.enable_learning:
                     experiences = self._collect_experiences(
-                        decision_output, impl_outputs, validation_output, reward
+                        decision_output, impl_outputs, reward
                     )
                     self.experience_buffer.add_batch(experiences)
                     
@@ -313,22 +278,14 @@ class HierarchicalOrchestrator:
                         yield "[协调器] 策略已更新\n"
                 
                 # === 检查退出条件 ===
-                if validation_output.reward_signal >= self.config.reward_threshold:
+                if reward >= self.config.reward_threshold:
                     yield f"[协调器] 达到奖励阈值 ({self.config.reward_threshold})，提前结束\n"
                     break
-                
-                # === 根据反馈调整 ===
-                if iteration < self.config.max_iterations - 1:
-                    yield "[协调器] 根据反馈调整，进入下一轮...\n"
-                    query = self._incorporate_feedback(query, validation_output)
                 
                 iteration += 1
             
             # 结束轨迹
-            success = (
-                validation_output.reward_signal >= self.config.reward_threshold
-                if validation_output else False
-            )
+            success = reward >= self.config.reward_threshold
             self.trajectory_recorder.end_trajectory(success=success)
             
             # 编译最终输出
@@ -347,14 +304,12 @@ class HierarchicalOrchestrator:
                 query=query,
                 decision_output=decision_output,
                 implementation_outputs=impl_outputs,
-                validation_output=validation_output,
+                validation_output=None,
                 total_iterations=iteration + 1,
                 final_reward=self._global_state.total_reward,
                 execution_time_seconds=execution_time,
                 success=success,
-                summary=self._generate_summary(
-                    decision_output, impl_outputs, validation_output
-                )
+                summary=self._generate_summary(decision_output, impl_outputs)
             )
             
         except Exception as e:
@@ -368,7 +323,6 @@ class HierarchicalOrchestrator:
         self,
         decision_output: DecisionOutput,
         impl_outputs: List[ImplementationOutput],
-        validation_output: ValidationOutput,
         reward: float
     ) -> List[Experience]:
         """收集经验"""
@@ -378,7 +332,7 @@ class HierarchicalOrchestrator:
         exp = self.decision_layer.collect_decision_experience(
             context=LayerContext(query=self._global_state.current_query),
             output=decision_output,
-            reward=reward * 0.3
+            reward=reward * 0.4
         )
         experiences.append(exp)
         
@@ -389,46 +343,16 @@ class HierarchicalOrchestrator:
             exp = self.implementation_layer.collect_implementation_experience(
                 task=task,
                 output=impl_output,
-                reward=reward * 0.4 / max(len(impl_outputs), 1)
+                reward=reward * 0.6 / max(len(impl_outputs), 1)
             )
             experiences.append(exp)
         
-        # 检验层经验
-        exp = self.validation_layer.collect_validation_experience(
-            context=LayerContext(query=self._global_state.current_query),
-            output=validation_output,
-            reward=reward * 0.3
-        )
-        experiences.append(exp)
-        
         return experiences
-    
-    def _incorporate_feedback(
-        self,
-        query: str,
-        validation_output: ValidationOutput
-    ) -> str:
-        """根据反馈调整查询"""
-        if not validation_output.suggestions:
-            return query
-        
-        # 提取高优先级建议
-        high_priority = [
-            s for s in validation_output.suggestions
-            if s.priority >= 7
-        ]
-        
-        if high_priority:
-            feedback_text = "; ".join([s.title for s in high_priority[:3]])
-            return f"{query}\n\n【反馈调整】请特别注意: {feedback_text}"
-        
-        return query
     
     def _generate_summary(
         self,
         decision_output: Optional[DecisionOutput],
-        impl_outputs: List[ImplementationOutput],
-        validation_output: Optional[ValidationOutput]
+        impl_outputs: List[ImplementationOutput]
     ) -> str:
         """生成执行摘要"""
         parts = []
@@ -442,9 +366,6 @@ class HierarchicalOrchestrator:
                 if o.status.value == "completed"
             )
             parts.append(f"实施: 完成{completed}/{len(impl_outputs)}个任务")
-        
-        if validation_output:
-            parts.append(f"检验: {validation_output.overall_assessment}")
         
         return "; ".join(parts) if parts else "执行完成"
     
@@ -474,14 +395,12 @@ class HierarchicalOrchestrator:
         """初始化协调器"""
         await self.decision_layer.initialize()
         await self.implementation_layer.initialize()
-        await self.validation_layer.initialize()
         self._logger.info("协调器初始化完成")
     
     async def shutdown(self):
         """关闭协调器"""
         await self.decision_layer.shutdown()
         await self.implementation_layer.shutdown()
-        await self.validation_layer.shutdown()
         self._logger.info("协调器已关闭")
     
     def reset(self):

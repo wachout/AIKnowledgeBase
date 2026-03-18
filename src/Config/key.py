@@ -4,7 +4,7 @@
 '''
 Created on 2024年9月5日
 
-@author: 
+@author: wangchao
 '''
 
 # import torch
@@ -24,6 +24,10 @@ VECTOR_MODEL_PATH = "./Weight"
 FILE_PATH = "./conf/file"
 
 SQLITE_PATH = "./conf/splite"
+
+# RERANKER_URL = "http://192.168.35.125:9997/v1/rerank"
+
+# XINFERENCE_URL = "http://192.168.35.125:9997"
 
 MODEL_SOURCE = ["xinference", "qwen", "ollama"]
 

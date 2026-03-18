@@ -38,6 +38,7 @@ from Control.control_graph import CControl as GraphController
 
 # from Agent import analysis_schema_run
 from Agent.AgenticSqlAgent.AnalysisSql.database_analysis_agent import DatabaseAnalysisAgent
+from Config.elasticsearch_config import is_elasticsearch_enabled
 
 # from Agent.SqlIntelligentAgents.sql_intelligent_workflow import SqlIntelligentWorkflow
 # from Agent.SqlIntelligentAgents.select_sql_agent import SelectSqlAgent
@@ -795,7 +796,7 @@ class CControl:
                     content_str = ";".join(columns_comments)
                     permission_level = "public"
                     # 保存到Elasticsearch（如果启用）
-                    from Config.elasticsearch_config import is_elasticsearch_enabled
+                    
                     if is_elasticsearch_enabled():
                         self.elasticsearch_obj.save_document_to_elastic(sql_id, file_id, 
                                                                         user_id, permission_level,
@@ -1053,9 +1054,10 @@ class CControl:
         """删除数据库数据"""
         sql_id = param.get("sql_id")
         
-        #self.graph_obj.delete_sql_graph_data(sql_id)
-        #self.graph_obj.delete_all_graph()
-        #self.vector_agent.delete_vector_store_by_sql_id(sql_id)
+        # self.graph_obj.delete_sql_graph_data(sql_id)
+        # self.graph_obj.delete_all_graph()
+        
+        self.vector_agent.delete_vector_store_by_sql_id(sql_id)
         
         self.elasticsearch_obj.delete_knowledge_elasticsearch_data(knowledge_id=sql_id)
         

@@ -1,15 +1,12 @@
 """
-实施与专业领域知识划分层 - 圆桌讨论主类（第二层）
+实施层圆桌讨论主类
 
-核心为「实施」与「按领域细化」：对第一层讨论共识进行专业领域划分，产出各领域细化实施步骤。
 实现完整的实施讨论系统，采用动态专家生成模式：
-1. 科学家分析任务需求，确定所需专家及领域划分
+1. 科学家分析任务需求，确定所需专家
 2. 动态生成各领域专家智能体
-3. 任务细化分配：按领域分解为可执行子任务及详细步骤
-4. 各领域专家给出详细实施方案（步骤细化与扩展）
-5. 综合者汇总各领域方案，保留领域细化步骤，找出质疑点
-
-约定：第二层每个智能体的结果由控制层统一保存到 discussion/discussion_id/pro 目录。
+3. 专家讨论，各自给出实施方案
+4. 综合者汇总方案，找出质疑点
+5. 输出传递给第三层检验系统
 """
 
 from dataclasses import dataclass, field
@@ -17,14 +14,13 @@ from datetime import datetime
 from typing import Dict, List, Optional, Any, AsyncGenerator, TYPE_CHECKING
 import asyncio
 import logging
-import os
 import uuid
+import os
+import re
+import json
 
 # 复用第一层圆桌讨论的通信组件
 from ....roundtable import MessageBus, CommunicationProtocol, AgentMessage, MessageType
-
-# 领域步骤模板（用于任务细化时的领域步骤扩展）
-from .domain_step_templates import get_phase_hints_for_domain
 
 # 本模块组件
 from .implementation_consensus import (
@@ -58,79 +54,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _get_layer1_domain_experts_from_participants(participants: List[Any]) -> List[Dict[str, Any]]:
-    """
-    从第一层参与者列表解析出「领域专家」名单，用于第二层与第一层一一对应创建实施步骤智能体。
-    第一层命名约定：expert_<领域名> 为领域专家，skeptic_expert_<领域名> 为对应质疑者。
-    """
-    if not participants:
-        return []
-    experts = []
-    seen_domains = set()
-    for p in participants:
-        name = (p.get("name") if isinstance(p, dict) else str(p)).strip()
-        if not name.startswith("expert_") or name.startswith("skeptic_expert_"):
-            continue
-        domain = name.replace("expert_", "", 1).strip()
-        if not domain or domain in seen_domains:
-            continue
-        seen_domains.add(domain)
-        experts.append({
-            "role": f"impl_{domain}",
-            "name": domain,
-            "domain": domain,
-            "reason": "对应第一层该领域专家，根据其讨论结果与质疑者意见给出可实施步骤",
-            "expertise": [f"{domain}实施", "步骤细化", "可执行方案"],
-            "priority": 1,
-        })
-    return experts
-
-
-def _get_layer1_speeches_by_domain(rounds: List[Dict[str, Any]]) -> Dict[str, Dict[str, List[Dict[str, Any]]]]:
-    """
-    从第一层各轮发言中按领域汇总：每个领域专家的发言、以及针对该领域专家的质疑者发言。
-    第二层使用第一层智能体的「最终修订稿」：每个领域每轮只保留该专家在该轮的最后一条发言
-    （即两轮质疑→修订后的最终稿），便于实施层基于稳定结论做步骤细化。
-    返回 { "领域名": { "expert_speeches": [...], "skeptic_speeches": [...] } }
-    """
-    by_domain = {}
-    for round_data in rounds or []:
-        rn = round_data.get("round_number", 0)
-        for speech_data in round_data.get("speeches", []):
-            speaker = speech_data.get("speaker", "")
-            is_skeptic = speech_data.get("is_skeptic", False)
-            target_expert = speech_data.get("target_expert", "")
-            content = {
-                "round": rn,
-                "thinking": speech_data.get("thinking", ""),
-                "speech": speech_data.get("speech", ""),
-                "target_expert": target_expert,
-            }
-            if is_skeptic and target_expert:
-                domain = target_expert.replace("expert_", "", 1).strip() if "expert_" in target_expert else target_expert
-                if domain not in by_domain:
-                    by_domain[domain] = {"expert_speeches": [], "skeptic_speeches": [], "_final_by_round": {}}
-                by_domain[domain]["skeptic_speeches"].append(content)
-            elif speaker.startswith("expert_") and not speaker.startswith("skeptic_expert_"):
-                domain = speaker.replace("expert_", "", 1).strip()
-                if domain not in by_domain:
-                    by_domain[domain] = {"expert_speeches": [], "skeptic_speeches": [], "_final_by_round": {}}
-                # 每轮只保留该领域专家的最后一条发言（最终修订稿）
-                by_domain[domain]["_final_by_round"][rn] = content
-    # 将每轮最终稿转为 expert_speeches 列表（按轮次排序）
-    for domain in by_domain:
-        final_by_round = by_domain[domain].pop("_final_by_round", {})
-        by_domain[domain]["expert_speeches"] = [final_by_round[r] for r in sorted(final_by_round.keys())]
-    return by_domain
-
-
 @dataclass
 class DiscussionConfig:
     """讨论配置"""
-    max_experts: int = 6                 # 最大专家数量
-    min_experts: int = 3                 # 最小专家数量
+    max_experts: int = 50                # 最大专家数量（不限制，按角色安排文件创建）
+    min_experts: int = 2                 # 最小专家数量
     timeout_seconds: float = 600.0       # 讨论超时时间
-    enable_debate: bool = True           # 是否启用辩论
+    enable_debate: bool = False          # 是否启用交叉审阅辩论（默认关闭以提高效率）
     enable_consensus_tracking: bool = True  # 是否启用共识追踪
     min_consensus_level: float = 0.6     # 最低共识度要求
 
@@ -162,8 +92,8 @@ class DiscussionResult:
     implementation_plan: str = ""
     # 交叉审阅结果
     cross_reviews: List[Dict[str, Any]] = field(default_factory=list)
-    # 细化任务分配（第二层规划时对任务的更细分解与角色分配）
-    refined_task_assignment: List[Dict[str, Any]] = field(default_factory=list)
+    # 专家发言文件记录（用于任务恢复）
+    expert_speech_files: List[Dict[str, Any]] = field(default_factory=list)  # [{expert_name, domain, relative_file_path, timestamp}]
 
 
 class ImplementationDiscussion:
@@ -267,58 +197,84 @@ class ImplementationDiscussion:
             task_name="实施讨论"
         )
         
-        # 第一层领域专家与发言汇总（第二层与第一层一一对应）
-        participants = first_layer_output.get("participants", [])
-        rounds = first_layer_output.get("rounds", [])
-        layer1_domain_experts = _get_layer1_domain_experts_from_participants(participants)
-        layer1_speeches_by_domain = _get_layer1_speeches_by_domain(rounds)
-        user_goal = first_layer_output.get("user_goal", "") or first_layer_output.get("discussion_summary", "")
-        
         yield "\n" + "=" * 60 + "\n"
-        yield "          实施步骤细化层 (与第一层领域专家一一对应)\n"
+        yield "          实施圆桌讨论系统 (动态专家模式)\n"
         yield "=" * 60 + "\n"
         
         try:
-            # ============ 阶段1: 科学家分析（若有第一层领域专家则与之对齐） ============
-            yield "\n[阶段1/5] 任务与第一层讨论对齐\n"
-            yield "-" * 40 + "\n"
+            # ============ 优先使用角色安排文件 ============
+            role_arrangement_file = first_layer_output.get('implementation_role_arrangement_file', '')
+            pre_defined_roles = []
+            if role_arrangement_file and os.path.exists(role_arrangement_file):
+                try:
+                    with open(role_arrangement_file, 'r', encoding='utf-8') as f:
+                        pre_defined_roles = json.load(f)
+                    yield f"\n[信息] 已加载角色安排文件，共 {len(pre_defined_roles)} 个角色\n"
+                except Exception as e:
+                    logger.warning(f"加载角色安排文件失败: {e}")
             
-            self.scholar = ScholarAgent(llm_adapter=self.llm_adapter)
-            async for chunk in self.scholar.analyze_required_experts(
-                task_list, first_layer_output
-            ):
-                yield chunk
+            # ============ 阶段1: 确定专家团队 ============
+            if pre_defined_roles:
+                # 使用预定义角色，跳过科学家分析
+                yield "\n[阶段1/5] 使用预定义角色安排\n"
+                yield "-" * 40 + "\n"
+                yield f"[信息] 从角色安排文件加载 {len(pre_defined_roles)} 个角色\n"
+                
+                # 转换为专家规格
+                expert_specs = []
+                for role in pre_defined_roles:
+                    expert_specs.append({
+                        "role": role.get('role_name', '').replace(' ', '_').lower(),
+                        "name": role.get('role_name', '领域专家'),
+                        "domain": role.get('professional_domain', role.get('layer', '通用')),
+                        "expertise": role.get('skills', []),
+                        "reason": role.get('role_description', '项目需要'),
+                        "tasks": role.get('tasks', []),
+                        "layer": role.get('layer', '')
+                    })
+                
+                self._current_result.scholar_analysis = {
+                    "task_analysis": "使用预定义角色安排",
+                    "project_type": "综合项目",
+                    "required_experts": expert_specs
+                }
+            else:
+                # 无预定义角色，使用科学家分析
+                yield "\n[阶段1/5] 科学家分析任务需求\n"
+                yield "-" * 40 + "\n"
+                
+                self.scholar = ScholarAgent(llm_adapter=self.llm_adapter)
+                
+                async for chunk in self.scholar.analyze_required_experts(
+                    task_list, first_layer_output
+                ):
+                    yield chunk
+                
+                # 获取分析结果
+                expert_specs = self.scholar.get_required_experts_specs()
+                self._current_result.scholar_analysis = {
+                    "task_analysis": self.scholar.last_analysis.task_analysis if self.scholar.last_analysis else "",
+                    "project_type": self.scholar.last_analysis.project_type if self.scholar.last_analysis else "",
+                    "required_experts": expert_specs
+                }
             
-            expert_specs = self.scholar.get_required_experts_specs()
-            # 第二层与第一层一一对应：若有第一层领域专家，则以其为准创建第二层实施步骤智能体
-            if layer1_domain_experts:
-                expert_specs = layer1_domain_experts[: self.config.max_experts]
-                yield f"\n[对齐第一层] 已按第一层 {len(expert_specs)} 个领域专家创建对应实施步骤智能体\n"
-            
-            self._current_result.scholar_analysis = {
-                "task_analysis": self.scholar.last_analysis.task_analysis if self.scholar.last_analysis else "",
-                "project_type": self.scholar.last_analysis.project_type if self.scholar.last_analysis else "",
-                "required_experts": expert_specs,
-                "layer1_aligned": bool(layer1_domain_experts),
-            }
-            
-            # ============ 阶段2: 动态生成专家（与第一层领域一一对应） ============
+            # ============ 阶段2: 动态生成专家 ============
             yield "\n\n[阶段2/5] 动态生成专家团队\n"
             yield "-" * 40 + "\n"
             
             self.expert_factory = DynamicAgentFactory(llm_adapter=self.llm_adapter)
             
-            specs_to_create = expert_specs[:self.config.max_experts]
+            # 使用全部专家规格（不再限制数量）
+            specs_to_create = expert_specs
             if len(specs_to_create) < self.config.min_experts:
                 default_specs = [
                     {"role": "project_planner", "name": "项目规划师", "domain": "项目规划", "reason": "统筹项目"},
-                    {"role": "technical_expert", "name": "技术专家", "domain": "技术实施", "reason": "技术支持"},
-                    {"role": "quality_manager", "name": "质量管理师", "domain": "质量控制", "reason": "质量保障"}
+                    {"role": "technical_expert", "name": "技术专家", "domain": "技术实施", "reason": "技术支持"}
                 ]
                 for spec in default_specs:
                     if len(specs_to_create) >= self.config.min_experts:
                         break
-                    if spec['role'] not in [s['role'] for s in specs_to_create]:
+                    if spec['role'] not in [s.get('role', '') for s in specs_to_create]:
                         specs_to_create.append(spec)
             
             self.dynamic_experts = self.expert_factory.create_experts_batch(specs_to_create)
@@ -328,92 +284,149 @@ class ImplementationDiscussion:
                 yield f"  {i}. {expert.name} ({expert.domain})\n"
                 self._current_result.experts_created.append(expert.to_dict())
             
-            # ============ 阶段2.5: 任务细化分配 ============
-            yield "\n\n[阶段2.5/5] 任务细化分配\n"
-            yield "-" * 40 + "\n"
-            refined_tasks = []
-            async for chunk in self._refine_task_assignment(task_list, expert_specs):
-                yield chunk
-            if hasattr(self, '_last_refined_tasks') and self._last_refined_tasks:
-                refined_tasks = self._last_refined_tasks
-                self._current_result.refined_task_assignment = refined_tasks
-                yield f"  已细化 {len(refined_tasks)} 项子任务并分配责任角色\n"
-            else:
-                self._current_result.refined_task_assignment = [{"task": t, "assigned_roles": []} for t in task_list]
+            # ============ 保存专家角色Prompt到roles目录 ============
+            discussion_base_path = first_layer_output.get('discussion_base_path', '')
+            if discussion_base_path:
+                roles_dir = os.path.join(discussion_base_path, "roles")
+                os.makedirs(roles_dir, exist_ok=True)
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                
+                for expert in self.dynamic_experts:
+                    role_file = self._save_expert_role_prompt(
+                        expert, roles_dir, timestamp, first_layer_output
+                    )
+                    if role_file:
+                        yield f"  [角色文件] {os.path.basename(role_file)}\n"
             
             # ============ 阶段3a: 专家独立提案 ============
             yield "\n\n[阶段3a/5] 专家独立提案\n"
             yield "-" * 40 + "\n"
             
-            # 第一层发言保存目录，供第二层专家在 JSON 解析失败时从 md 回退读取（优先使用 control 传入的绝对路径）
-            discuss_dir = first_layer_output.get("discuss_dir") or os.path.join(
-                "discussion", str(first_layer_output.get("discussion_id", "")), "discuss"
-            )
-            # 构建任务上下文（含第一层本领域发言与质疑者意见，供专家给出可实施步骤并反复验证）
-            task_context_base = {
+            # 构建任务上下文
+            task_context = {
                 "task_list": task_list,
-                "refined_task_assignment": getattr(self._current_result, 'refined_task_assignment', []) or [],
                 "first_layer_output": first_layer_output,
-                "user_goal": user_goal,
-                "layer1_speeches_by_domain": layer1_speeches_by_domain,
-                "discuss_dir": discuss_dir,
                 "task": {
                     "name": "实施方案讨论",
                     "description": first_layer_output.get('discussion_summary', '')
                 }
             }
-            layer1_summary = first_layer_output.get('layer1_summary', {})
-            if layer1_summary:
-                task_context_base['layer1_summary_index'] = layer1_summary
-                yield f"[信息] 已加载第一层讨论汇总文档索引\n"
             
-            expert_proposals = []
+            # 加载第一层汇总文档索引
+            layer1_summary_index = first_layer_output.get('layer1_summary', {})
+            layer1_role_summaries = {}  # role -> summary_content
+            
+            # 如果有第一层汇总文档索引，加载各角色汇总
+            if layer1_summary_index:
+                task_context['layer1_summary_index'] = layer1_summary_index
+                yield f"[信息] 已加载第一层讨论汇总文档索引\n"
+                
+                # 从索引中获取各角色汇总文档
+                role_summary_records = layer1_summary_index.get('role_summary_records', [])
+                discussion_base = first_layer_output.get('discussion_base_path', '')
+                
+                for record in role_summary_records:
+                    role_name = record.get('role', '')
+                    relative_file = record.get('relative_file', '')
+                    if relative_file and discussion_base:
+                        full_path = os.path.join(discussion_base, relative_file)
+                        if os.path.exists(full_path):
+                            try:
+                                with open(full_path, 'r', encoding='utf-8') as f:
+                                    content = f.read()
+                                layer1_role_summaries[role_name] = content
+                                # 也用领域名存一份（去掉 expert_ 前缀）
+                                if role_name.startswith('expert_'):
+                                    domain_name = role_name.replace('expert_', '').split('（')[0]
+                                    layer1_role_summaries[domain_name] = content
+                            except Exception as e:
+                                logger.warning(f"读取角色汇总文档失败 {full_path}: {e}")
+                
+                if layer1_role_summaries:
+                    yield f"[信息] 已加载 {len(layer1_role_summaries)} 个领域汇总文档\n"
+            
+            # ============ 并行执行专家发言 ============
+            yield f"\n[信息] {len(self.dynamic_experts)} 位专家并行生成发言中...\n"
+            
+            # 为每个专家准备上下文
+            expert_contexts = []
             for expert in self.dynamic_experts:
-                # 为该领域注入第一层本领域专家发言与质疑者意见，便于给出可实施步骤并验证
-                task_context = dict(task_context_base)
-                domain_speeches = layer1_speeches_by_domain.get(expert.domain, {})
-                task_context["first_layer_expert_speeches"] = domain_speeches.get("expert_speeches", [])
-                task_context["first_layer_skeptic_critiques"] = domain_speeches.get("skeptic_speeches", [])
-                proposal_content = []
-                async for chunk in expert.propose_solution(task_context):
-                    yield chunk
-                    proposal_content.append(chunk)
-                proposal_content = "".join(proposal_content)
-
-                # 第二层：每个专家对应质疑者，质疑→专家修订，循环两次，得到最终修订稿（第三层将使用此稿）
-                revision_cycles = 2
-                for cycle in range(1, revision_cycles + 1):
-                    challenge = await self._generate_layer2_skeptic_challenge(
-                        expert.name, expert.domain, proposal_content
-                    )
-                    if not (challenge and challenge.strip()):
-                        break
-                    yield f"\n[质疑者-{expert.domain}] 第{cycle}轮质疑\n"
-                    yield f"{challenge[:500]}{'...' if len(challenge) > 500 else ''}\n"
-                    try:
-                        revised = await expert.revise_proposal_after_skeptic(
-                            proposal_content, challenge, task_context, revision_round=cycle
-                        )
-                        if revised and revised.strip():
-                            proposal_content = revised
-                    except Exception as e:
-                        logger.warning(f"[{expert.name}] 第{cycle}轮修订失败: {e}")
-
-                # 使用结构化的 ExpertProposal 数据（若修订后未重新解析则沿用 last_proposal）
+                # 为当前专家查找匹配的第一层领域汇总文档
+                expert_domain_summary = ""
+                if layer1_role_summaries:
+                    domain = expert.domain
+                    possible_keys = [
+                        domain,
+                        f"expert_{domain}",
+                        f"expert_{domain}（与对应质疑者）",
+                    ]
+                    for key in possible_keys:
+                        if key in layer1_role_summaries:
+                            expert_domain_summary = layer1_role_summaries[key]
+                            break
+                    # 模糊匹配
+                    if not expert_domain_summary:
+                        for key, content in layer1_role_summaries.items():
+                            if domain in key or key in domain:
+                                expert_domain_summary = content
+                                break
+                
+                # 构建专家上下文
+                expert_task_context = task_context.copy()
+                if expert_domain_summary:
+                    expert_task_context['layer1_domain_summary_md'] = expert_domain_summary
+                expert_contexts.append((expert, expert_task_context, bool(expert_domain_summary)))
+            
+            # 并行执行所有专家的发言任务
+            async def expert_propose_task(expert, ctx):
+                """单个专家的发言任务"""
+                return await expert.propose_solution_full(ctx)
+            
+            tasks = [expert_propose_task(exp, ctx) for exp, ctx, _ in expert_contexts]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # 处理并行执行结果
+            expert_proposals = []
+            for i, (expert, ctx, has_summary) in enumerate(expert_contexts):
+                result = results[i]
+                
+                if isinstance(result, Exception):
+                    logger.warning(f"专家 {expert.name} 发言失败: {result}")
+                    yield f"\n[{expert.name}] 发言失败: {result}\n"
+                    continue
+                
+                # 输出发言内容
+                yield f"\n[{expert.name}] ({expert.domain})"
+                if has_summary:
+                    yield " [已加载第一层汇总]"
+                yield f"\n{'─' * 40}\n"
+                yield result
+                yield f"\n{'─' * 40}\n"
+                
+                # 获取结构化数据
                 structured_proposal = None
                 if expert.last_proposal:
                     structured_proposal = expert.last_proposal.to_dict()
-                # 记录最终修订稿（供第三层与保存使用）
+                
+                # 记录方案
                 proposal = {
                     "expert_name": expert.name,
                     "domain": expert.domain,
-                    "content": proposal_content,
+                    "content": result,
                     "structured": structured_proposal
                 }
                 expert_proposals.append(proposal)
                 self._current_result.expert_proposals.append(proposal)
-
-                # 记录到共识追踪器: 专家对自己方案持 AGREE 立场
+                
+                # 保存专家发言到implement目录
+                if discussion_base_path:
+                    speech_file = self._save_expert_speech(
+                        expert, proposal, discussion_base_path, timestamp
+                    )
+                    if speech_file:
+                        yield f"  [发言已保存] {os.path.basename(speech_file)}\n"
+                
+                # 记录到共识追踪器
                 if self.config.enable_consensus_tracking:
                     self.consensus_tracker.record_opinion(
                         agent_id=expert.agent_id,
@@ -424,9 +437,8 @@ class ImplementationDiscussion:
                         content=f"{expert.name} 提出了{expert.domain}领域的实施方案",
                         supporting_evidence=[expert.domain]
                     )
-                
-                # 更新上下文（供后续专家参考已产生的方案）
-                task_context_base["other_proposals"] = expert_proposals.copy()
+            
+            yield f"\n[信息] {len(expert_proposals)} 位专家并行发言完成\n"
             
             # ============ 阶段3b: 专家交叉审阅 ============
             cross_reviews = []  # 所有审阅结果
@@ -434,8 +446,7 @@ class ImplementationDiscussion:
                 yield "\n\n[阶段3b/5] 专家交叉审阅\n"
                 yield "-" * 40 + "\n"
                 yield f"[信息] {len(self.dynamic_experts)} 位专家互相审阅方案\n\n"
-                review_ctx = dict(task_context_base)
-                review_ctx["other_proposals"] = expert_proposals.copy()
+                
                 for reviewer_expert in self.dynamic_experts:
                     for proposal in expert_proposals:
                         # 不审阅自己的方案
@@ -443,7 +454,7 @@ class ImplementationDiscussion:
                             continue
                         
                         review_content = []
-                        async for chunk in reviewer_expert.review_proposal(proposal, review_ctx):
+                        async for chunk in reviewer_expert.review_proposal(proposal, task_context):
                             yield chunk
                             review_content.append(chunk)
                         
@@ -478,7 +489,7 @@ class ImplementationDiscussion:
                 yield f"\n[交叉审阅完成] 共产生 {len(cross_reviews)} 条审阅意见\n"
             
             # 将交叉审阅结果写入上下文，供综合者使用
-            task_context_base['cross_reviews'] = cross_reviews
+            task_context['cross_reviews'] = cross_reviews
             
             # ============ 阶段4: 综合者汇总 ============
             yield "\n\n[阶段4/5] 综合者汇总\n"
@@ -487,7 +498,7 @@ class ImplementationDiscussion:
             self.synthesizer = SynthesizerAgent(llm_adapter=self.llm_adapter)
             
             async for chunk in self.synthesizer.synthesize_and_challenge(
-                expert_proposals, task_context_base
+                expert_proposals, task_context
             ):
                 yield chunk
             
@@ -522,7 +533,7 @@ class ImplementationDiscussion:
             yield f"  - 交叉审阅意见: {len(cross_reviews)} 条\n"
             
             # ============ 填充结构化字段 ============
-            self._current_result.total_rounds = 5  # 五个阶段
+            self._current_result.total_rounds = 5  # 五个阶段（取消了团体汇总）
             self._current_result.final_consensus_level = overall_consensus
             
             # 存储交叉审阅结果
@@ -559,85 +570,6 @@ class ImplementationDiscussion:
             if self._current_result:
                 self._current_result.success = False
     
-    async def _refine_task_assignment(
-        self,
-        task_list: List[Dict[str, Any]],
-        expert_specs: List[Dict[str, Any]]
-    ) -> AsyncGenerator[str, None]:
-        """第二层规划时细化任务分配：按知识领域将任务分解为可执行子任务及详细步骤，并分配责任角色。"""
-        import json as _json
-        import re as _re
-        self._last_refined_tasks = []
-        if not self.llm_adapter or not task_list or not expert_specs:
-            yield "  无 LLM 或任务/专家列表，跳过细化分配\n"
-            return
-        expert_items = [(s.get("name", s.get("role", "")), s.get("domain", "")) for s in expert_specs[:10]]
-        expert_lines = "\n".join(f"  - {n}（{d}）" for n, d in expert_items if n)
-        tasks_text = "\n".join(
-            f"  - {t.get('name', '')}: {t.get('description', '')[:150]}"
-            for t in task_list[:15]
-        )
-        # 构建领域步骤扩展提示（供 LLM 参考）
-        domains = [d for _, d in expert_items if d]
-        domain_hints = []
-        for d in domains[:5]:
-            hints = get_phase_hints_for_domain(d)
-            if hints:
-                domain_hints.append(f"  - {d}: {', '.join(hints[:4])}...")
-        domain_hints_text = "\n".join(domain_hints) if domain_hints else "  - 通用: 需求理解、方案设计、执行实施、检查验证、交付总结"
-
-        prompt = f"""你是一位项目规划专家，负责「实施与专业领域知识划分」：将任务按知识领域拆成可执行的子任务，并为每个子任务列出详细实施步骤。
-
-## 任务列表
-{tasks_text}
-
-## 可用专家角色（含专业领域）
-{expert_lines}
-
-## 各领域的典型步骤参考（用于细化子任务）
-{domain_hints_text}
-
-## 输出要求
-
-请输出 JSON 数组，每个元素形如：
-{{
-  "parent_task": "原任务名",
-  "domain": "该子任务所属领域（对应上面专家领域）",
-  "subtask_name": "子任务名称",
-  "subtask_description": "子任务描述",
-  "sub_steps": [
-    {{"step_name": "步骤名", "description": "具体做什么", "deliverable": "产出物"}},
-    ...
-  ],
-  "assigned_role": "负责的专家名",
-  "sequence": 1
-}}
-
-要求：
-1. 子任务要按领域划分，每个子任务只分配一位主要负责专家
-2. sub_steps 至少 3 项，要细化到可执行级别
-3. 每个步骤需包含 step_name、description、deliverable
-4. 充分利用各领域的典型步骤参考进行扩展"""
-        try:
-            response = await asyncio.wait_for(
-                asyncio.to_thread(lambda: self.llm_adapter.invoke(prompt).content),
-                timeout=60.0
-            )
-            m = _re.search(r'\[\s*\{[\s\S]*\}\s*\]', response)
-            if m:
-                raw = m.group()
-                # 移除 JSON 中未转义的控制字符，避免 json.loads 报 Invalid control character
-                raw_clean = _re.sub(r'[\x00-\x1f]', ' ', raw)
-                arr = _json.loads(raw_clean)
-                if isinstance(arr, list):
-                    self._last_refined_tasks = arr[:50]
-                    yield f"  已分解并分配 {len(self._last_refined_tasks)} 项子任务（含领域细化步骤）\n"
-            else:
-                yield "  未解析到有效子任务列表，将使用原任务列表\n"
-        except Exception as e:
-            logger.warning(f"任务细化分配异常: {e}")
-            yield f"  任务细化分配异常，将使用原任务列表: {str(e)[:80]}\n"
-    
     def get_output_for_validation(self) -> Dict[str, Any]:
         """
         获取传递给第三层检验系统的输出
@@ -652,7 +584,6 @@ class ImplementationDiscussion:
             "discussion_id": self._current_result.discussion_id,
             "scholar_analysis": self._current_result.scholar_analysis,
             "experts": self._current_result.experts_created,
-            "refined_task_assignment": getattr(self._current_result, "refined_task_assignment", []) or [],
             "proposals": self._current_result.expert_proposals,
             "cross_reviews": self._current_result.cross_reviews,
             "synthesized_plan": self._current_result.synthesized_plan,
@@ -662,52 +593,9 @@ class ImplementationDiscussion:
             "total_rounds": self._current_result.total_rounds,
             "consensus_level": self._current_result.final_consensus_level,
             "consensus_summary": self.consensus_tracker.get_discussion_summary() if self.consensus_tracker else {},
-            "ready_for_validation": self._current_result.success
+            "ready_for_validation": self._current_result.success,
         }
     
-    async def _generate_layer2_skeptic_challenge(
-        self, expert_name: str, domain: str, proposal_content: str
-    ) -> str:
-        """第二层：针对某专家方案生成质疑者的一轮质疑内容（偏向具像化与可实施，避免虚理论）。"""
-        prompt = f"""你是实施阶段的质疑者，专门对「{domain}」领域专家 {expert_name} 的实施方案进行批判性审阅。
-
-**重要原则：质疑必须偏向「具像化的计划与实施」，不要停留在虚理论。** 多问具体步骤、责任、验收与时间线，少问抽象概念。
-
-## 该专家的方案内容
-{proposal_content[:6000]}
-
-## 任务（优先具像化与可执行）
-请从以下维度提出建设性质疑（抓住可落地、可验收的要点）：
-1. **可执行步骤**：是否拆成具体动作？缺哪些步骤、责任人或交付物？时间与里程碑是否清晰？
-2. **验收与指标**：如何判断某一步完成？有无可量化的验收标准？
-3. **实施约束**：资源、依赖、技术约束是否写清？实施难度与成本是否现实？
-4. **风险与替代**：落地过程中有哪些具体风险？有无更易实施的替代做法？
-
-**请避免**：只谈「应加强」「需重视」等空泛表述；**务必**把质疑落在具体计划、步骤与验收上。
-
-请直接输出你的质疑与建议（一段完整文字），不要用 JSON，不要加「质疑：」等前缀。"""
-        try:
-            if getattr(self, "llm_adapter", None) is None:
-                return ""
-            if hasattr(self.llm_adapter, "invoke"):
-                response = await asyncio.wait_for(
-                    asyncio.to_thread(
-                        lambda: self.llm_adapter.invoke(prompt)
-                    ),
-                    timeout=60.0,
-                )
-                text = getattr(response, "content", None) or (response if isinstance(response, str) else "")
-                return (text or "").strip()
-            # 回退：用任意一位专家的 call_llm
-            if self.dynamic_experts:
-                parts = []
-                async for chunk in self.dynamic_experts[0].call_llm(prompt):
-                    parts.append(chunk)
-                return "".join(parts).strip()
-        except Exception as e:
-            logger.warning(f"第二层质疑生成失败 ({expert_name}): {e}")
-        return ""
-
     def _extract_key_decisions(self, validation_output: Dict[str, Any]) -> List[str]:
         """从综合方案中提取关键决策"""
         decisions = []
@@ -786,32 +674,9 @@ class ImplementationDiscussion:
                             if isinstance(step, str):
                                 parts.append(f"  {j}. {step}\n")
                             elif isinstance(step, dict):
-                                name = step.get('name', step.get('description', str(step)))
-                                desc = step.get('description', '')
-                                deliverable = step.get('deliverable', '')
-                                parts.append(f"  {j}. {name}\n")
-                                if desc and desc != name:
-                                    parts.append(f"     {desc}\n")
-                                if deliverable:
-                                    parts.append(f"     交付物: {deliverable}\n")
+                                parts.append(f"  {j}. {step.get('name', step.get('description', str(step)))}\n")
                     if deliverables:
                         parts.append(f"- 交付物: {', '.join(deliverables)}\n")
-        
-        # 按领域划分的步骤汇总
-        domain_breakdown = validation_output.get('domain_breakdown', [])
-        if domain_breakdown:
-            parts.append(f"\n## 各领域实施步骤汇总\n")
-            for db in domain_breakdown:
-                if isinstance(db, dict):
-                    domain = db.get('domain', '')
-                    expert = db.get('expert', '')
-                    key_steps = db.get('key_steps', [])
-                    duration = db.get('duration', '')
-                    parts.append(f"\n### {domain}（负责: {expert}）\n")
-                    if duration:
-                        parts.append(f"- 预估时间: {duration}\n")
-                    for i, s in enumerate(key_steps[:10], 1):
-                        parts.append(f"  {i}. {s}\n")
         
         # 资源需求
         resources = validation_output.get('required_resources', [])
@@ -865,3 +730,181 @@ class ImplementationDiscussion:
         self.consensus_tracker.clear()
         self._current_result = None
 
+    def _save_expert_role_prompt(
+        self,
+        expert: DynamicExpertAgent,
+        roles_dir: str,
+        timestamp: str,
+        first_layer_output: Dict[str, Any]
+    ) -> Optional[str]:
+        """
+        保存动态专家的角色Prompt到roles目录
+        
+        Args:
+            expert: 动态专家智能体实例
+            roles_dir: 角色文件保存目录
+            timestamp: 时间戳
+            first_layer_output: 第一层输出（用于构建上下文）
+        
+        Returns:
+            保存的文件路径，失败返回None
+        """
+        try:
+            # 构建角色文件名（第二层_领域名_时间戳）
+            safe_domain = expert.domain.replace("/", "_").replace("\\", "_")
+            role_filename = f"layer2_expert_{safe_domain}_{timestamp}.json"
+            role_path = os.path.join(roles_dir, role_filename)
+            
+            # 构建示例任务上下文以生成完整prompt
+            sample_task_context = {
+                "task_list": [],
+                "first_layer_output": first_layer_output,
+                "task": {
+                    "name": "实施方案讨论",
+                    "description": first_layer_output.get('discussion_summary', '')
+                },
+                "user_goal": first_layer_output.get('user_goal', ''),
+            }
+            
+            # 获取专家的提案prompt
+            proposal_prompt = expert._build_proposal_prompt(sample_task_context)
+            
+            # 构建角色定义
+            expertise_text = "、".join(expert.expertise) if expert.expertise else expert.domain
+            role_definition = f"{expert.domain}领域实施专家，专注于将第一层讨论成果转化为可执行的实施步骤"
+            
+            # 构建完整的角色JSON
+            role_data = {
+                "agent_id": expert.agent_id,
+                "agent_name": expert.name,
+                "layer": "实施层（第二层）",
+                "role": expert.role,
+                "domain": expert.domain,
+                "expertise": expert.expertise,
+                "reason": expert.reason,
+                "role_definition": role_definition,
+                "professional_skills": [
+                    f"{expert.domain}专业知识",
+                    "实施步骤细化",
+                    "方案设计与规划",
+                    "风险评估与规避",
+                    "资源预估与依赖分析"
+                ] + list(expert.expertise[:3]),
+                "working_style": "专业严谨、注重可执行性",
+                "behavior_guidelines": [
+                    "紧扣用户目标，不做空泛表述",
+                    "每个步骤具体可执行，含输入条件、具体动作、产出物",
+                    "基于第一层讨论成果细化实施方案",
+                    "考虑实际可行性和约束条件",
+                    "提供风险评估和规避措施",
+                    "在本领域内创新突破，但不越界到其他专业"
+                ],
+                "output_format": """
+## 专业分析
+[从本领域角度对任务关键点的专业分析]
+
+## 实施步骤
+### 步骤1: [步骤名称]
+- **描述**: [详细描述这一步要做什么]
+- **预估时间**: [如：2天、1周]
+- **交付物**: [这一步的产出]
+- **验收标准**: [如何验证完成]
+
+### 步骤2: ...
+
+## 所需资源
+- [资源1]
+- [资源2]
+
+## 风险与规避
+| 风险 | 严重程度 | 规避措施 |
+|------|----------|----------|
+| ... | 高/中/低 | ... |
+
+## 验证要点
+[如何反复验证实施准确性]
+""",
+                "system_prompt": proposal_prompt,
+                "health_status": "healthy",
+                "created_at": datetime.now().isoformat(),
+            }
+            
+            # 保存角色文件
+            with open(role_path, "w", encoding="utf-8") as f:
+                json.dump(role_data, f, ensure_ascii=False, indent=2)
+            
+            logger.info(f"保存第二层专家角色Prompt: {role_filename}")
+            return role_path
+            
+        except Exception as e:
+            logger.warning(f"保存专家角色Prompt失败 ({expert.name}): {e}")
+            return None
+
+    def _save_expert_speech(
+        self,
+        expert: DynamicExpertAgent,
+        proposal: Dict[str, Any],
+        discussion_base_path: str,
+        timestamp: str
+    ) -> Optional[str]:
+        """
+        保存专家发言到implement目录
+        
+        Args:
+            expert: 专家智能体实例
+            proposal: 专家提案内容
+            discussion_base_path: 讨论基础目录
+            timestamp: 时间戳
+        
+        Returns:
+            保存的文件路径，失败返回None
+        """
+        try:
+            # 确保implement目录存在
+            implement_dir = os.path.join(discussion_base_path, "implement")
+            os.makedirs(implement_dir, exist_ok=True)
+            
+            # 构建文件名（专家名_领域_时间戳）
+            safe_name = expert.name.replace("/", "_").replace("\\", "_").replace(" ", "_")
+            safe_domain = expert.domain.replace("/", "_").replace("\\", "_").replace(" ", "_")
+            speech_filename = f"expert_speech_{safe_name}_{safe_domain}_{timestamp}.md"
+            speech_path = os.path.join(implement_dir, speech_filename)
+            
+            # 构建发言内容
+            content = proposal.get('content', '')
+            structured = proposal.get('structured', {})
+            
+            # 写入Markdown文件
+            with open(speech_path, "w", encoding="utf-8") as f:
+                f.write(f"# 第二层专家发言 - {expert.name}\n\n")
+                f.write(f"**领域**: {expert.domain}\n")
+                f.write(f"**专长**: {', '.join(expert.expertise) if expert.expertise else '通用'}\n")
+                f.write(f"**时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+                f.write("---\n\n")
+                f.write("## 发言内容\n\n")
+                f.write(content)
+                
+                # 如果有结构化数据，也保存
+                if structured:
+                    f.write("\n\n---\n\n## 结构化数据\n\n")
+                    f.write("```json\n")
+                    f.write(json.dumps(structured, ensure_ascii=False, indent=2))
+                    f.write("\n```\n")
+            
+            logger.info(f"保存第二层专家发言: {speech_filename}")
+            
+            # 记录到 expert_speech_files 用于任务恢复
+            if self._current_result:
+                relative_path = f"implement/{speech_filename}"
+                self._current_result.expert_speech_files.append({
+                    "expert_name": expert.name,
+                    "domain": expert.domain,
+                    "relative_file_path": relative_path,
+                    "timestamp": timestamp,
+                })
+            
+            return speech_path
+            
+        except Exception as e:
+            logger.warning(f"保存专家发言失败 ({expert.name}): {e}")
+            return None

@@ -14,11 +14,16 @@ import logging
 import uuid
 import asyncio
 import traceback
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from typing import Dict, Any, List, Optional
 from datetime import datetime
 
 from Db.sqlite_db import cSingleSqlite
 from Config.llm_config import get_chat_tongyi
+try:
+    from Config.llm_config import get_chat_long
+except Exception:
+    get_chat_long = None
 from Roles import RoundtableDiscussion
 
 # 导入三层系统组件
@@ -26,16 +31,172 @@ from Roles.hierarchy import (
     # 类型定义
     Task, Objective, Constraint, DecisionOutput, ImplementationOutput,
     ExecutionStatus, ImplementationRole,
+    LayerContext,
     # 实施层
     ImplementationLayer,
-    # 检验层  
-    ValidationLayer
 )
 from Roles.hierarchy.layers.implementation_layer import ImplementGroupScheduler, ImplementationGroup
 from Roles.hierarchy.layers.implementation_roundtable import ImplementationDiscussion
 from Roles.hierarchy.layers.concretization_roundtable import ConcretizationDiscussion
 
 logger = logging.getLogger(__name__)
+
+# 第一层讨论汇总：按「发言智能体 + 该智能体对应的质疑者」一起汇总为一个结果，不分开汇总专家与质疑者
+# 每个汇总单元 = 某专家的全部发言 + 针对该专家的质疑者发言，合并为一份汇总
+LAYER1_PER_ROLE_SUMMARY_PROMPT = """# Role：圆桌讨论汇总专家
+
+## Background：
+第一层圆桌讨论结束后，按「发言的智能体与其对应质疑者」**一起**汇总为一份结果。**每份汇总**包含：（1）**该专家/智能体的全部发言**（多轮、思考、内容），（2）**针对该专家的质疑者发言**。将二者合并审视后输出**一条**结构清晰、**侧重有价值和可实施信息**的 Markdown 汇总段落，供第二层实施专家按领域查阅。不将专家与质疑者分开汇总。
+
+## Attention：
+请结合该角色发言与对应角色发言，识别**讨论与矛盾**之处；在汇总时**选择有价值和可实施的信息**，对争议点可做简要归纳或采纳更可实施的立场，不编造原文没有的信息，输出需可独立理解、便于落地。
+
+## Profile：
+- Author: prompt-optimizer
+- Version: 1.0
+- Language: 中文
+- Description: 圆桌讨论汇总专家将「该专家全部发言」与「针对该专家的质疑者发言」合并为一条汇总（专家与对应质疑者一起汇总，不分开），提炼核心观点与可执行建议，识别讨论与矛盾并筛选有价值、可实施的内容，输出便于第二层任务分解的汇总。
+
+### Skills:
+- 从该角色多轮发言与对应方发言中提炼核心观点与主要立场，识别讨论与矛盾
+- 识别并保留关键论据、数据、指标（参数、规格、时间节点等），优先保留可验证、可落地的信息
+- 在存在分歧或矛盾时，选择更有价值、更可实施的结论或建议，可简要说明不同观点及采纳理由
+- 将结论与可执行建议归纳为要点或列表，便于下游任务分解与实施
+
+## Goals:
+- 提炼该角色的核心观点与主要立场
+- 结合对应角色发言，识别**讨论与矛盾**
+- **选择有价值和可实施的信息**写入汇总：保留关键论据与数据，对争议点做取舍或归纳
+- 明确归纳结论与可执行建议（要点或列表），便于第二层实施
+
+## Constrains:
+- 仅基于下方提供的「该角色全部发言」与「对应角色发言」进行提炼，不得编造
+- 输出为纯 Markdown，可使用二级/三级标题、有序/无序列表、加粗等
+- 不得输出任何与汇总无关的前缀或后缀，直接输出 Markdown 汇总正文
+
+## Workflow:
+1. 通读该角色的全部发言与对应角色发言，标记讨论与矛盾
+2. 从中选择有价值、可实施的信息，对矛盾点做取舍或简要归纳
+3. 按「核心观点 → 关键论据与数据 → 结论与建议 → 讨论/矛盾与采纳说明（若有）」组织内容
+4. 输出结构清晰的 Markdown 段落，保证可独立理解、便于第二层按角色查阅与落地
+
+## OutputFormat:
+- 核心观点（可选小标题，段落或列表）
+- 关键论据与数据（保留参数、规格、时间等，侧重可实施信息）
+- 结论与建议（要点或有序列表，可执行优先）
+- 讨论/矛盾与采纳说明（若有：争议点、不同观点、采纳或取舍理由）
+
+## Initialization
+作为圆桌讨论汇总专家，你必须遵守上述约束条件，使用中文输出，且直接输出 Markdown 汇总正文，不要输出与汇总无关的前缀或后缀。
+
+---
+请基于下方「该角色的全部发言」与「对应角色发言」内容，完成该角色的汇总，**选择有价值和可实施的信息**，直接输出符合 OutputFormat 的 Markdown 正文。"""
+
+# 第二层实施任务分析智能体（方案实施架构师）：阅读第一层汇总文档与索引，输出任务分解、RACI、人力资源配置
+IMPLEMENTATION_TASK_ANALYSIS_AGENT_PROMPT = """# Role：方案实施架构师
+
+## Background：
+用户希望基于会议讨论的最终方案，构建一个结构清晰、责任明确且可执行性强的人员安排与任务分配体系。该任务需要对方案进行深度解析，并根据以下三个职能层级（基础执行层、协调管理层、战略指导层）进行人员配置与职责划分：
+- **基础执行层**：负责具体操作性任务，具有明确输入输出和标准化流程，通常由一线员工或技术专员承担；
+- **协调管理层**：负责跨部门沟通、资源调配及进度控制，需具备一定的统筹能力和项目管理经验；
+- **战略指导层**：负责制定方向、评估风险与关键决策，通常由高层管理者或专家顾问担任。
+同时确保任务分解具备中等颗粒度并采用RACI模型进行角色分配。
+
+## Attention：
+请以高度专业性和系统性完成此任务，确保每个层级的人员配置逻辑合理、任务分配清晰、时间节点明确，最终输出结果需具有可操作性和落地价值。
+
+## Profile：
+- Author: prompt-optimizer
+- Version: 1.0
+- Language: 中文
+- Description: 方案实施架构师是一种专注于将抽象方案转化为具体执行路径的专业角色，擅长任务分解、资源规划和组织设计，能够结合项目管理方法论与实际业务场景制定高效可行的实施方案。
+
+### Skills:
+- 精通项目管理流程，熟悉WBS（工作分解结构）与RACI矩阵的应用
+- 具备跨部门协作与沟通能力，能识别关键利益相关方并合理分配角色
+- 擅长任务粒度控制，能根据复杂程度将任务拆解为2人日以内的子任务
+- 能够根据任务类型匹配合适的专业人才，并评估其所需技能与资源
+- 熟悉时间估算技术（如三点估算法），能为每项任务设定精确时长，并在必要时提供估算依据
+
+## Goals:
+- 解析会议最终方案的核心内容与实施逻辑，识别关键里程碑与依赖关系
+- 将方案分解为三个层级的任务模块：基础执行层（负责具体操作性任务）、协调管理层（负责跨部门沟通和资源调配）、战略指导层（负责制定方向和关键决策）
+- 为每个任务定义输入/输出内容、所需资源、预估时长及交付标准
+- 使用RACI模型为每个任务分配角色，确保R与A角色明确，C与I角色合理
+- **识别每个岗位所需的专业领域**（如：软件架构、机械设计、项目管理、仿生学、控制理论、材料工程等），确保人员配置与任务需求匹配
+- 输出完整的人力资源配置表，包含岗位名称、职责描述、所属层级、**专业领域**、参与任务列表、关键技能要求
+
+## Constrains:
+- 所有任务必须被拆解为中等颗粒度（建议单个子任务时长控制在2人日之间，确保可独立交付）
+- 每个任务必须至少包含1个R（执行者）和1个A（负责人）
+- 时间估算需精确到小时，不得使用模糊表述
+- 不得遗漏任何影响任务执行的关键资源或外部依赖
+- RACI角色配置需依据任务影响范围进行动态调整，避免过度或不足配置
+
+## Workflow:
+1. 阅读并理解会议最终方案，提取关键任务与目标，绘制初步任务框架
+2. 根据任务属性与复杂度，将其归类至基础执行层、协调管理层或战略指导层
+3. 对每个任务进行细化分解，确保符合中等颗粒度要求，并为每个子任务设定输入/输出、资源需求及时长
+4. 应用RACI模型为每个子任务分配角色，确保职责清晰、权责对等
+5. **为每个岗位明确所需专业领域**（与职责、任务相匹配的学科或行业领域），并列出关键技能要求
+6. 整合所有信息，形成完整的任务清单、人力资源配置表（含专业领域与关键技能要求）及时间进度计划
+
+## OutputFormat:
+- 任务分解清单（含任务编号、名称、层级、输入/输出、资源需求、预估时长）
+- RACI角色分配表（按任务编号列出R/A/C/I角色及其对应人员）
+- 人力资源配置表（**必须为 Markdown 表格**，表头包含：岗位名称、职责描述、所属层级、**专业领域**、参与任务列表、关键技能要求；专业领域填写该岗位所需的学科/行业领域，如「软件架构」「机械设计」「项目管理」「仿生学」等，便于系统据此自动创建对应角色智能体）
+
+## Suggestions:
+- 定期回顾任务分解的合理性，确保任务之间无重复或遗漏
+- 在RACI角色分配过程中，优先考虑角色的实际能力和过往经验
+- 建立任务之间的依赖关系图，有助于识别关键路径与潜在瓶颈
+- 结合敏捷方法，为复杂任务预留缓冲时间和应急资源
+- 利用可视化工具（如甘特图、泳道图）辅助任务展示与沟通
+
+## Initialization
+作为方案实施架构师，你必须遵守上述约束条件，使用默认中文与用户交流。
+
+---
+请基于下方提供的「第一层圆桌讨论汇总文档」与「第一层汇总文档索引」内容，完成方案实施架构分析，直接输出符合 OutputFormat 的 Markdown 文档（任务分解清单、RACI角色分配表、人力资源配置表），不要输出与文档无关的前缀或后缀。"""
+
+# 第二层角色安排智能体：根据「任务分析与人员要求」文档抽取需要的人员角色，输出结构化 JSON，供系统自动创建对应智能体
+IMPLEMENTATION_ROLE_ARRANGEMENT_AGENT_PROMPT = """# Role：角色安排抽取专家
+
+## 任务
+下方是一份由「任务分析与人员要求智能体」（方案实施架构师）产出的人力资源配置文档，可能包含任务分解清单、RACI 角色分配表、人力资源配置表等。请你**从中抽取所有需要的人员/岗位角色**，输出为**唯一**的 JSON 数组，便于系统据此自动创建对应的实施角色智能体。
+
+## 输出要求
+1. **仅输出一个 JSON 数组**，不要输出任何 Markdown、说明或前后缀。
+2. 数组中每个元素表示一个角色，**必须**包含字段：
+   - **role_name** (string)：岗位/角色名称
+   - **role_description** (string)：职责描述（简要）
+   - **layer** (string)：所属层级（如：基础执行层、协调管理层、战略指导层，可空字符串）
+   - **professional_domain** (string)：专业领域（如：软件架构、机械设计、项目管理，无则用角色名）
+   - **tasks** (array of string)：该角色参与的任务编号或任务名称列表（如 ["T001","T002"] 或 ["任务名称1","任务名称2"]）
+   - **skills** (array of string)：关键技能要求列表（如 ["项目管理","沟通协调"]，可空数组）
+3. 不遗漏文档中出现的任何岗位/角色；同一岗位只出现一次。
+4. 若文档中无表格或表格解析困难，请根据段落、列表中的岗位与任务描述自行归纳为上述结构。
+
+## 示例（仅作格式参考，勿照抄）
+[
+  {"role_name": "项目总监", "role_description": "负责项目总体方向与关键决策", "layer": "战略指导层", "professional_domain": "项目管理", "tasks": ["T012","T017"], "skills": ["高层管理","决策力"]},
+  {"role_name": "系统工程师", "role_description": "需求与接口管理", "layer": "协调管理层", "professional_domain": "系统工程", "tasks": ["T005","T013"], "skills": ["MBSE","需求工程"]}
+]
+
+请直接输出 JSON 数组，不要用 markdown 代码块包裹。"""
+
+# 第二层实施文档汇总智能体：阅读各角色执行结果，使用长文本大模型生成一份完整实施文档
+LAYER2_IMPLEMENTATION_SUMMARY_AGENT_PROMPT = """你是一名实施文档汇总专家。你的任务是一次性阅读下方「各角色实施执行结果」的全部内容，生成一份结构清晰、便于落地执行的**实施文档**（Markdown）。
+
+## 要求
+1. 输出为纯 Markdown，包含（可自拟小节标题）：
+   - **文档概述**：项目/方案目标、总体思路
+   - **角色与责任**：各实施角色及其职责
+   - **任务与步骤**：按角色或按阶段整理的任务清单、实施步骤、交付物、预估时长
+   - **资源与依赖**：所需资源、关键依赖与风险提示
+   - **执行建议**：优先级、里程碑、验收要点
+2. 内容需基于下方各角色原文提炼与整合，不编造；可合并重复、补全逻辑顺序
+3. 直接输出 Markdown 正文，不要输出「好的，以下是」等前缀或后缀。"""
 
 
 class DiscussionControl:
@@ -185,7 +346,26 @@ class DiscussionControl:
         # 如果有第一层汇总文档索引，传入
         if 'layer1_summary' in discussion_state:
             first_layer_output['layer1_summary'] = discussion_state['layer1_summary']
-        
+        # 若第二层任务分析/角色安排已发言过，恢复文件路径供本次直接使用
+        base_for_impl = os.path.abspath(discussion_base_path)
+        if discussion_state.get('implementation_task_analysis_file'):
+            rel = discussion_state['implementation_task_analysis_file']
+            abs_path = os.path.join(base_for_impl, rel) if not os.path.isabs(rel) else rel
+            if os.path.isfile(abs_path):
+                first_layer_output['implementation_task_analysis_file'] = abs_path
+        if discussion_state.get('implementation_role_arrangement_file'):
+            rel = discussion_state['implementation_role_arrangement_file']
+            abs_path = os.path.join(base_for_impl, rel) if not os.path.isabs(rel) else rel
+            if os.path.isfile(abs_path):
+                first_layer_output['implementation_role_arrangement_file'] = abs_path
+        # 第二层智能体是否已发言：供再次启动时跳过已发言的智能体，直接使用已保存方案
+        layer2 = discussion_state.get('layer2') or {}
+        first_layer_output['layer2_speeches'] = layer2.get('speeches', [])
+        first_layer_output['layer2_expert_has_spoken'] = layer2.get('expert_has_spoken', [])
+        first_layer_output['discussion_base_path'] = discussion_base_path
+        # 第二层流程进度：动态角色发言进度；再次启动时检查并从未执行步骤继续
+        first_layer_output['layer2_process'] = discussion_state.get('layer2_process') or {}
+
         # 构建任务列表
         task_list = []
         for task in decision_output.tasks:
@@ -199,8 +379,96 @@ class DiscussionControl:
         logger.info(f"第二层接收 {len(task_list)} 个任务")
         if first_layer_output.get('layer1_summary'):
             logger.info("已加载第一层汇总文档索引")
+            # 任务分析智能体：若已发言过则使用已有文档，否则调用 LLM 并做发言记录
+            task_analysis_path = first_layer_output.get("implementation_task_analysis_file")
+            if task_analysis_path and os.path.isfile(task_analysis_path):
+                logger.info("任务分析与人员要求智能体已发言，使用文档中的内容: %s", task_analysis_path)
+            else:
+                logger.info("开始执行第二层任务分析智能体（将读取第一层汇总并调用长文本模型，可能需数分钟，请稍候）...")
+                try:
+                    task_analysis_path = self._run_implementation_task_analysis_agent(
+                        discussion_base_path, first_layer_output
+                    )
+                    if task_analysis_path:
+                        logger.info("📋 第二层实施任务分析已生成: %s", task_analysis_path)
+                        # 发言记录：写入 discussion_state.layer2_speeches，并持久化任务分析文件路径
+                        try:
+                            rel_path = os.path.relpath(task_analysis_path, discussion_base_path)
+                            discussion_state["implementation_task_analysis_file"] = rel_path
+                            if "layer2_speeches" not in discussion_state:
+                                discussion_state["layer2_speeches"] = []
+                            discussion_state["layer2_speeches"].append({
+                                "speaker": "方案实施架构师",
+                                "role_type": "task_analysis",
+                                "content_type": "task_analysis",
+                                "relative_md_file": rel_path,
+                                "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S"),
+                                "datetime": datetime.now().isoformat(),
+                            })
+                            discussion_state["updated_at"] = datetime.now().isoformat()
+                            self._save_discussion_state(discussion_base_path, discussion_state)
+                        except Exception as save_err:
+                            logger.warning("保存任务分析发言记录失败: %s", save_err)
+                        # 角色安排智能体：从任务分析文档抽取人员角色列表（表格解析失败时供第二层创建智能体）
+                        try:
+                            role_arr_path = self._run_implementation_role_arrangement_agent(
+                                discussion_base_path, first_layer_output
+                            )
+                            if role_arr_path:
+                                logger.info("📋 第二层角色安排（抽取角色）已生成: %s", role_arr_path)
+                                try:
+                                    rel_role = os.path.relpath(role_arr_path, discussion_base_path)
+                                    discussion_state["implementation_role_arrangement_file"] = rel_role
+                                    if "layer2_speeches" not in discussion_state:
+                                        discussion_state["layer2_speeches"] = []
+                                    discussion_state["layer2_speeches"].append({
+                                        "speaker": "角色抽取智能体",
+                                        "role_type": "role_arrangement",
+                                        "content_type": "role_arrangement",
+                                        "relative_json_file": rel_role,
+                                        "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S"),
+                                        "datetime": datetime.now().isoformat(),
+                                    })
+                                    discussion_state["updated_at"] = datetime.now().isoformat()
+                                    self._save_discussion_state(discussion_base_path, discussion_state)
+                                except Exception as e:
+                                    logger.warning("保存角色抽取智能体发言记录失败: %s", e)
+                        except Exception as ra_err:
+                            logger.warning("角色安排智能体异常: %s", ra_err)
+                    else:
+                        logger.debug("未执行或跳过实施任务分析智能体")
+                except Exception as ta_err:
+                    logger.warning("实施任务分析智能体异常（继续执行第二层讨论）: %s", ta_err)
+            # 若已有任务分析文档但尚无角色安排 JSON，可补跑角色安排智能体
+            if first_layer_output.get("implementation_task_analysis_file") and not first_layer_output.get("implementation_role_arrangement_file"):
+                try:
+                    role_arr_path = self._run_implementation_role_arrangement_agent(
+                        discussion_base_path, first_layer_output
+                    )
+                    if role_arr_path:
+                        logger.info("📋 第二层角色安排（抽取角色）已生成: %s", role_arr_path)
+                        try:
+                            rel_role = os.path.relpath(role_arr_path, discussion_base_path)
+                            discussion_state["implementation_role_arrangement_file"] = rel_role
+                            if "layer2_speeches" not in discussion_state:
+                                discussion_state["layer2_speeches"] = []
+                            discussion_state["layer2_speeches"].append({
+                                "speaker": "角色抽取智能体",
+                                "role_type": "role_arrangement",
+                                "content_type": "role_arrangement",
+                                "relative_json_file": rel_role,
+                                "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S"),
+                                "datetime": datetime.now().isoformat(),
+                            })
+                            discussion_state["updated_at"] = datetime.now().isoformat()
+                            self._save_discussion_state(discussion_base_path, discussion_state)
+                        except Exception as e:
+                            logger.warning("保存角色抽取智能体发言记录失败: %s", e)
+                except Exception as ra_err:
+                    logger.warning("角色安排智能体异常: %s", ra_err)
         
         try:
+            logger.info("第二层实施讨论即将启动（异步 run_implementation_discussion）...")
             # 运行异步讨论
             async def run_discussion():
                 outputs = []
@@ -251,45 +519,23 @@ class DiscussionControl:
                 # 综合者产出（综合方案）-> implement/
                 if result.synthesized_plan:
                     self._save_layer2_synthesized_plan(discussion_base_path, result)
-                # 第二层智能体信息保存到 roles/，以 layer_2_ 前缀区分第一层
-                layer2_participants = []
-                layer2_agents = []
-                for expert in (result.experts_created or []):
-                    name = expert.get('name') or expert.get('role') or expert.get('domain') or 'expert'
-                    self._save_agent_config(discussion_base_path, f"layer_2_{name}", expert)
-                    layer2_participants.append(name)
-                    layer2_agents.append({
-                        "name": name,
-                        "domain": expert.get("domain", ""),
-                        "role": expert.get("role", ""),
-                    })
-                layer2_speeches = []
-                # 第二层实施方案保存到 implement/
-                impl_dir = os.path.join(discussion_base_path, "implement")
-                os.makedirs(impl_dir, exist_ok=True)
-                for i, prop in enumerate(result.expert_proposals or []):
-                    safe = re.sub(r'[^\w\u4e00-\u9fa5]', '_', (prop.get('expert_name') or f'proposal_{i}')[:50])
-                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    rel_md = f"implement/impl_expert_{safe}_proposal_{ts}.md"
+                # 第二层创建的角色智能体保存到 discussion/xxx/roles/（layer_2_ 前缀），便于恢复与查看
+                self._save_layer2_roles_and_state(
+                    discussion_base_path, result, discussion_state
+                )
+                logger.info("第二层角色智能体已保存到 roles 目录: %s", os.path.join(discussion_base_path, "roles"))
+                # 任务分析驱动时：角色执行结果保存到 concretization/，并调用汇总智能体生成实施文档
+                if first_layer_output.get("implementation_task_analysis_file") and (result.expert_proposals or []):
                     try:
-                        with open(os.path.join(impl_dir, f"impl_expert_{safe}_proposal_{ts}.md"), 'w', encoding='utf-8') as f:
-                            f.write(prop.get('content', ''))
-                        with open(os.path.join(impl_dir, f"impl_expert_{safe}_proposal_{ts}.json"), 'w', encoding='utf-8') as f:
-                            json.dump({"expert_name": prop.get("expert_name"), "domain": prop.get("domain"), "structured": prop.get("structured")}, f, ensure_ascii=False, indent=2)
-                        layer2_speeches.append({
-                            "speaker": prop.get("expert_name") or f"专家_{i}",
-                            "relative_file_path": rel_md,
-                            "timestamp": ts,
-                        })
-                    except Exception as ex:
-                        logger.warning(f"保存第二层专家发言失败: {ex}")
-                discussion_state['layer2'] = {
-                    'participants': layer2_participants,
-                    'agents': layer2_agents,
-                    'speeches': layer2_speeches,
-                    'completed_at': datetime.now().isoformat(),
-                }
-                    
+                        self._save_layer2_results_to_concretization(discussion_base_path, result)
+                        summary_path = self._run_implementation_summary_agent(
+                            discussion_base_path, result.expert_proposals
+                        )
+                        if summary_path:
+                            logger.info("📄 实施文档（汇总）已生成: %s", summary_path)
+                    except Exception as conc_ex:
+                        logger.warning("保存到 concretization 或实施文档汇总失败: %s", conc_ex)
+
         except Exception as e:
             logger.error(f"❌ 实施讨论失败: {e}", exc_info=True)
             impl_output = ImplementationOutput(
@@ -297,7 +543,29 @@ class DiscussionControl:
                 status=ExecutionStatus.FAILED
             )
             impl_outputs.append(impl_output)
+            # 即使讨论中途失败，也保存已创建的第二层角色到 roles，便于恢复或查看
+            result = getattr(impl_discussion, '_current_result', None)
+            if result and (result.experts_created or []):
+                try:
+                    self._save_layer2_roles_and_state(
+                        discussion_base_path, result, discussion_state
+                    )
+                    logger.info("已保存第二层已创建角色到 roles（讨论中途失败后的部分结果）")
+                except Exception as save_ex:
+                    logger.warning(f"保存第二层部分结果失败: {save_ex}")
+            # 第二层流程进度：部分完成也记录
+            if result is not None:
+                discussion_state['layer2_process'] = {
+                    'speeches_done': bool(getattr(result, 'expert_proposals', None) and len(result.expert_proposals) > 0),
+                }
+                self._save_discussion_state(discussion_base_path, discussion_state)
         
+        # 第二层流程进度记录：动态角色发言
+        _result = impl_result or getattr(impl_discussion, '_current_result', None)
+        if _result is not None:
+            discussion_state['layer2_process'] = {
+                'speeches_done': bool(getattr(_result, 'expert_proposals', None) and len(_result.expert_proposals) > 0),
+            }
         # 更新讨论状态
         discussion_state['implementation_layer'] = {
             'status': 'completed',
@@ -314,20 +582,62 @@ class DiscussionControl:
         self,
         discussion_base_path: str,
         discussion_id: str,
+        processed_experts: List[str] = None,
     ):
         """
-        运行第三层具像化层：阅读 implement/ 中的实施步骤，按领域创建具像化智能体，
+        运行第三层具像化层：阅读 implement/ 中的专家发言，按领域创建具像化智能体，
         执行数字化+具像化（符合第一性原理、物理守恒、材料约束等），结果保存到 concretization/。
+        支持任务恢复：传入已处理的专家列表，跳过已完成的专家。
+        
+        Args:
+            discussion_base_path: 讨论基础目录
+            discussion_id: 讨论ID
+            processed_experts: 已处理的专家发言文件名列表（base_name）
+        
+        Returns:
+            dict: {
+                "output_files": 具象化输出文件路径列表,
+                "processed_experts": 已处理的专家列表（包含本次新处理的）
+            }
         """
+        processed_experts = processed_experts or []
         try:
             llm_instance = self._get_llm_instance()
-            conc_discussion = ConcretizationDiscussion(llm_adapter=llm_instance)
+            # 为具像化层提供网络检索能力：查询细节步骤、定义与原理
+            web_search_fn = None
+            try:
+                from Roles.tools.tool_manager import ToolManager
+                from Roles.tools.web_search_tool import WebSearchTool
+                _tm = ToolManager()
+                _tm.register_tool(WebSearchTool())
+
+                def _web_search_for_concretization(query: str) -> str:
+                    res = _tm.execute_tool("web_search", {"query": query, "limit": 5})
+                    if not res.success or not getattr(res, "data", None):
+                        return ""
+                    data = res.data
+                    results = data.get("results", []) if isinstance(data, dict) else []
+                    return "\n".join(
+                        f"- {r.get('title', '')}: {r.get('snippet', '')}"
+                        for r in results[:5]
+                        if r.get("snippet") or r.get("title")
+                    )
+
+                web_search_fn = _web_search_for_concretization
+            except Exception as e:
+                logger.debug(f"具像化层未启用网络检索: {e}")
+
+            conc_discussion = ConcretizationDiscussion(
+                llm_adapter=llm_instance,
+                web_search_fn=web_search_fn,
+            )
 
             async def run_conc():
                 outputs = []
                 async for chunk in conc_discussion.run_concretization(
                     discussion_base_path=discussion_base_path,
                     discussion_id=discussion_id,
+                    processed_experts=processed_experts,
                 ):
                     # logger.info(chunk.strip())
                     outputs.append(chunk)
@@ -344,8 +654,31 @@ class DiscussionControl:
             except RuntimeError:
                 asyncio.run(run_conc())
             logger.info("✅ 第三层具像化层完成")
+            result = conc_discussion.get_last_result()
+            
+            # 构建返回结果
+            ret = {
+                "output_files": [],
+                "processed_experts": [],
+            }
+            
+            if result:
+                # 收集输出文件路径（转为相对路径）
+                if getattr(result, "summary_output_files", None):
+                    for p in result.summary_output_files:
+                        if os.path.isabs(p) and p.startswith(os.path.abspath(discussion_base_path)):
+                            ret["output_files"].append(os.path.relpath(p, discussion_base_path))
+                        else:
+                            ret["output_files"].append(p)
+                
+                # 收集已处理的专家列表
+                if getattr(result, "processed_experts", None):
+                    ret["processed_experts"] = result.processed_experts
+            
+            return ret
         except Exception as e:
             logger.error(f"❌ 第三层具像化层执行失败: {e}", exc_info=True)
+            return {"output_files": [], "processed_experts": []}
 
     def _save_implementation_result(self, discussion_base_path: str, task, result):
         """保存实施讨论结果到 discussion/discussion_id/implement/"""
@@ -396,6 +729,148 @@ class DiscussionControl:
         except Exception as e:
             logger.error(f"保存实施讨论结果失败: {e}")
     
+    def _save_layer2_roles_and_state(
+        self,
+        discussion_base_path: str,
+        result,
+        discussion_state: dict,
+    ):
+        """将第二层已创建智能体保存到 roles/（含每个角色配置 JSON 与对应 prompt 的 .md 文件），并写入 discussion_state['layer2']。讨论中途失败时也可调用以保存部分结果。"""
+        layer2_participants = []
+        layer2_agents = []
+        for expert in (result.experts_created or []):
+            name = expert.get('name') or expert.get('role') or expert.get('domain') or 'expert'
+            try:
+                # 保存到 roles：配置 JSON + 该角色 prompt 的 _prompt.md（由 _save_agent_config 一并写入）
+                self._save_agent_config(discussion_base_path, f"layer_2_{name}", expert)
+            except Exception as ex:
+                logger.warning(f"保存第二层角色配置失败 {name}: {ex}")
+            layer2_participants.append(name)
+            layer2_agents.append({
+                "name": name,
+                "domain": expert.get("domain", ""),
+                "role": expert.get("role", ""),
+            })
+        layer2_speeches = []
+        impl_dir = os.path.join(discussion_base_path, "implement")
+        os.makedirs(impl_dir, exist_ok=True)
+        info_entries = discussion_state.setdefault("info", [])
+        
+        # 从 result.expert_speech_files 读取已保存的发言文件（由 implementation_discussion 保存）
+        for speech_record in getattr(result, 'expert_speech_files', []) or []:
+            expert_name = speech_record.get("expert_name", "未知专家")
+            relative_path = speech_record.get("relative_file_path", "")
+            ts = speech_record.get("timestamp", datetime.now().strftime("%Y%m%d_%H%M%S"))
+            
+            layer2_speeches.append({
+                "speaker": expert_name,
+                "relative_file_path": relative_path,
+                "timestamp": ts,
+            })
+            logger.info(
+                "第二层专家「%s」发言已记录至 discussion_state.layer2.speeches: %s",
+                expert_name, relative_path,
+            )
+            info_entries.append({
+                "timestamp": datetime.now().isoformat(),
+                "message": f"第二层专家「{expert_name}」发言已保存至 {relative_path}",
+                "layer": "implementation",
+                "speaker": expert_name,
+                "relative_md": relative_path,
+            })
+        # 方案汇总智能体、角色分类智能体：写入 layer2_speeches 与 discussion_state，再次启动时可复用
+        if getattr(result, 'plan_summary_role_classification_file', None):
+            discussion_state["plan_summary_role_classification_file"] = result.plan_summary_role_classification_file
+            logger.info("角色分类智能体结果已记录至 discussion_state: %s", result.plan_summary_role_classification_file)
+            info_entries.append({
+                "timestamp": datetime.now().isoformat(),
+                "message": f"角色分类智能体已运行，分类结果已保存至 {result.plan_summary_role_classification_file}",
+                "layer": "implementation",
+                "speaker": "角色分类智能体",
+                "relative_md": result.plan_summary_role_classification_file,
+                "relative_json": "",
+            })
+        if getattr(result, 'plan_summary_file', None):
+            ts_plan = datetime.now().strftime("%Y%m%d_%H%M%S")
+            layer2_speeches.append({
+                "speaker": "方案汇总智能体",
+                "relative_file_path": result.plan_summary_file,
+                "relative_json_path": "",
+                "timestamp": ts_plan,
+            })
+            discussion_state["plan_summary_agent_file"] = result.plan_summary_file
+            logger.info("方案汇总智能体发言已记录至 discussion_state: %s", result.plan_summary_file)
+            info_entries.append({
+                "timestamp": datetime.now().isoformat(),
+                "message": f"方案汇总智能体已发言，汇总已保存至 {result.plan_summary_file}，已记录供再次启动时复用",
+                "layer": "implementation",
+                "speaker": "方案汇总智能体",
+                "relative_md": result.plan_summary_file,
+                "relative_json": "",
+            })
+        # 记录已完成的类别汇总，供任务恢复时跳过已完成的类别
+        if getattr(result, 'plan_summary_categories_done', None):
+            discussion_state["plan_summary_categories_done"] = result.plan_summary_categories_done
+            logger.info("已完成的类别汇总已记录至 discussion_state: %s", result.plan_summary_categories_done)
+        # 智能体是否发言：保存到 discussion_state，再次启动时已发言的智能体不再调用 LLM
+        expert_has_spoken = [s.get("speaker") for s in layer2_speeches if s.get("speaker")]
+        discussion_state['layer2'] = {
+            'participants': layer2_participants,
+            'agents': layer2_agents,
+            'speeches': layer2_speeches,
+            'expert_has_spoken': expert_has_spoken,
+            'completed_at': datetime.now().isoformat(),
+        }
+        discussion_state["updated_at"] = datetime.now().isoformat()
+        self._save_discussion_state(discussion_base_path, discussion_state)
+
+    def _proposal_content_to_markdown_no_json(
+        self,
+        content: str,
+        structured: Any,
+        expert_name: str,
+        domain: str,
+    ) -> str:
+        """将第二层智能体发言内容转为纯 Markdown（去掉 ```json ... ``` 代码块，不包含 JSON 格式内容）。"""
+        if not content and not structured:
+            return f"# {expert_name}\n\n**领域**: {domain}\n\n（无正文）\n"
+        parts = [f"# {expert_name}\n\n**领域**: {domain}\n\n---\n\n"]
+        # 去掉 content 中的 ```json ... ``` 块，保留其余正文
+        if content:
+            no_json = re.sub(r'```json\s*[\s\S]*?```', '\n\n（结构化数据见同名 .json 文件）\n\n', content, flags=re.IGNORECASE)
+            no_json = re.sub(r'```\s*[\s\S]*?```', '\n\n（代码块已省略，见同名 .json 文件）\n\n', no_json)
+            no_json = no_json.strip()
+            if no_json:
+                parts.append(no_json)
+                parts.append("\n\n")
+        # 若有 structured，转为可读的 Markdown 列表（不直接贴 JSON）
+        if structured and isinstance(structured, dict):
+            parts.append("## 结构化要点\n\n")
+            raw_steps = structured.get("implementation_steps")
+            impl_steps = raw_steps if isinstance(raw_steps, list) else []
+            if impl_steps:
+                for idx, step in enumerate(impl_steps, 1):
+                    if isinstance(step, dict):
+                        name = step.get("name") or step.get("step_name") or f"步骤{idx}"
+                        desc = step.get("description") or step.get("desc") or ""
+                        duration = step.get("duration") or step.get("duration_estimate") or ""
+                        deliverable = step.get("deliverable") or step.get("deliverables") or ""
+                        parts.append(f"### {idx}. {name}\n\n")
+                        if desc:
+                            parts.append(f"{desc}\n\n")
+                        if duration:
+                            parts.append(f"- **时长**: {duration}\n")
+                        if deliverable:
+                            parts.append(f"- **交付**: {deliverable}\n")
+                        parts.append("\n")
+                    else:
+                        parts.append(f"- {step}\n")
+            prof = structured.get("professional_analysis") or structured.get("summary") or ""
+            if prof and not (impl_steps and prof in str(impl_steps)):
+                parts.append("### 专业分析\n\n")
+                parts.append(f"{prof}\n\n")
+        return "".join(parts).strip() or f"# {expert_name}\n\n**领域**: {domain}\n\n（无正文）\n"
+
     def _save_layer2_scholar_result(self, discussion_base_path: str, result):
         """实施层：科学家智能体结果保存到 discussion/discussion_id/implement"""
         try:
@@ -537,25 +1012,27 @@ class DiscussionControl:
         query: str
     ) -> Optional[str]:
         """
-        生成第一层圆桌讨论的汇总文档（带目录索引）
+        生成第一层圆桌讨论的汇总文档（发言智能体与对应质疑者一起汇总，不分开）
         
-        将所有智能体的发言、质疑者发言、共识数据等汇总为带目录的文档，
-        供第二层实施层专家按领域快速查阅，节省 token。
+        按「发言的智能体 + 该智能体对应的质疑者」一起汇总为一个结果：每个专家与其对应质疑者的发言
+        合并为一条汇总，不再为专家和质疑者分别产出两条汇总。最后追加共识与分歧、最终报告与行动建议，供第二层实施层专家按领域查阅。
         
         生成两个文件:
-        1. Markdown 可读文档（带目录）
+        1. Markdown 可读文档（各角色汇总段 + 共识与最终报告）
         2. JSON 结构化索引（供程序化查询）
         
         Args:
             discussion_base_path: 讨论文件夹路径
-            discussion_state: 完整讨论状态
+            discussion_state: 完整讨论状态（汇总显示的讨论主题优先从 discussion_state['topic'] 读取）
             final_report: 最终报告
-            query: 用户原始查询
+            query: 用户原始查询（当 discussion_state 中无 topic 时作回退）
             
         Returns:
             汇总文档路径，失败返回 None
         """
         try:
+            # 主题优先从 discussion_state.json 的 topic 读取，避免显示为当前聊天内容（如「xxx 任务启动」）
+            topic = (discussion_state.get('topic') or '').strip() or (query or '')
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             discuss_dir = os.path.join(discussion_base_path, "discuss")
             os.makedirs(discuss_dir, exist_ok=True)
@@ -590,96 +1067,137 @@ class DiscussionControl:
                     if is_skeptic:
                         skeptic_speeches.append({**speech_entry, 'speaker': speaker})
             
-            # ---- Markdown 汇总文档 ----
-            md = []
             total_rounds = len(rounds_data)
             total_speeches = sum(len(r.get('speeches', [])) for r in rounds_data)
             participants = discussion_state.get('participants', [])
-            consensus_level = discussion_state.get('consensus_data', {}).get('overall_level', 0.0)
+            consensus_data = discussion_state.get('consensus_data', {})
+            consensus_level = consensus_data.get('overall_level', 0.0)
             
-            md.append(f"""# 圆桌讨论汇总文档
+            # ---- 按「发言智能体 + 对应质疑者」一起汇总为一个结果，不分开汇总 ----
+            md = []
+            doc_header = f"""# 圆桌讨论汇总文档
 
-**讨论主题**: {query}
+**讨论主题**: {topic}
 **生成时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 **总轮次**: {total_rounds} | **总发言**: {total_speeches} | **参与者**: {len(participants)} | **共识**: {consensus_level:.2f}
 
 ---
 
-""")
-            
-            # ---- 目录 (TOC) ----
-            md.append("## 目录\n\n")
-            toc_idx = 1
-            
-            md.append(f"{toc_idx}. [专家发言索引（按角色）](#专家发言索引按角色)\n")
-            toc_idx += 1
-            for speaker_name in all_speeches_by_speaker:
-                safe_anchor = re.sub(r'[^\w\u4e00-\u9fa5]', '', speaker_name)
-                any_skeptic = any(s['is_skeptic'] for s in all_speeches_by_speaker[speaker_name])
-                label = f"{speaker_name}（质疑者）" if any_skeptic else speaker_name
-                md.append(f"  - [{label}](#{safe_anchor})\n")
-            
-            if skeptic_speeches:
-                md.append(f"{toc_idx}. [质疑者发言汇总](#质疑者发言汇总)\n")
-                toc_idx += 1
-            
-            md.append(f"{toc_idx}. [各轮次讨论记录](#各轮次讨论记录)\n")
-            toc_idx += 1
-            for rn in sorted(all_speeches_by_round.keys()):
-                md.append(f"  - [第{rn}轮](#第{rn}轮讨论)\n")
-            
-            md.append(f"{toc_idx}. [共识与分歧](#共识与分歧)\n")
-            toc_idx += 1
-            md.append(f"{toc_idx}. [最终报告与行动建议](#最终报告与行动建议)\n")
-            md.append("\n---\n\n")
-            
-            # ---- 专家发言索引 ----
-            md.append("## 专家发言索引（按角色）\n\n")
-            md.append("> 第二层实施专家可根据角色名称快速定位相关领域的讨论内容。\n\n")
-            
-            for speaker_name, speeches in all_speeches_by_speaker.items():
-                any_skeptic = any(s['is_skeptic'] for s in speeches)
-                role_label = f"{speaker_name}（质疑者）" if any_skeptic else speaker_name
-                md.append(f"### {role_label}\n\n")
-                md.append(f"**发言次数**: {len(speeches)}\n\n")
-                
-                for idx, sp in enumerate(speeches, 1):
-                    md.append(f"#### 第{sp['round']}轮 发言#{idx}\n\n")
-                    if sp['is_skeptic'] and sp.get('target_expert'):
-                        md.append(f"**针对**: {sp['target_expert']}\n\n")
+"""
+            md.append(doc_header)
+
+            # 确定角色顺序：优先与 participants 一致，否则按 all_speeches_by_speaker 键顺序
+            ordered_speakers = []
+            for p in participants:
+                if p in all_speeches_by_speaker:
+                    ordered_speakers.append(p)
+            for name in all_speeches_by_speaker:
+                if name not in ordered_speakers:
+                    ordered_speakers.append(name)
+
+            # 针对某专家的质疑者发言：{ 专家名: [ {speaker, round, thinking, speech, target_expert}, ... ] }
+            skeptic_speeches_by_target = {}
+            for sk in skeptic_speeches:
+                target = (sk.get('target_expert') or '').strip()
+                if target:
+                    if target not in skeptic_speeches_by_target:
+                        skeptic_speeches_by_target[target] = []
+                    skeptic_speeches_by_target[target].append(sk)
+
+            def format_speech_list(speech_list, title_prefix=""):
+                parts = []
+                for idx, sp in enumerate(speech_list, 1):
+                    speaker = sp.get('speaker', '未知')
+                    parts.append(f"### {title_prefix}发言#{idx}（第{sp.get('round', 0)}轮）\n\n")
+                    if sp.get('target_expert'):
+                        parts.append(f"**针对**: {sp['target_expert']}\n\n")
                     if sp.get('thinking'):
-                        md.append(f"**思考**: {sp['thinking'][:500]}\n\n")
-                    md.append(f"**内容**: {sp.get('speech', '无')}\n\n")
-                md.append("---\n\n")
-            
-            # ---- 质疑者发言汇总 ----
-            if skeptic_speeches:
-                md.append("## 质疑者发言汇总\n\n")
-                for idx, sk in enumerate(skeptic_speeches, 1):
-                    md.append(f"### 质疑#{idx} (第{sk['round']}轮)\n\n")
-                    md.append(f"**质疑者**: {sk['speaker']}\n")
-                    if sk.get('target_expert'):
-                        md.append(f"**针对**: {sk['target_expert']}\n")
-                    md.append(f"\n{sk.get('speech', '无')}\n\n")
-                md.append("---\n\n")
-            
-            # ---- 各轮次记录 ----
-            md.append("## 各轮次讨论记录\n\n")
-            for rn in sorted(all_speeches_by_round.keys()):
-                sps = all_speeches_by_round[rn]
-                md.append(f"### 第{rn}轮讨论\n\n")
-                md.append(f"**发言数**: {len(sps)}\n\n")
-                for sp in sps:
-                    if sp.get('is_skeptic') and sp.get('target_expert'):
-                        md.append(f"**{sp['speaker']}** (质疑 -> {sp['target_expert']}):\n\n")
-                    else:
-                        md.append(f"**{sp['speaker']}**:\n\n")
-                    md.append(f"{sp.get('speech', '无')[:800]}\n\n")
-                md.append("---\n\n")
-            
-            # ---- 共识与分歧 ----
+                        parts.append(f"**思考**: {sp['thinking']}\n\n")
+                    parts.append(f"**{speaker} 内容**: {sp.get('speech', '无')}\n\n")
+                return "".join(parts)
+
+            per_role_sections = []
+            llm_used = False
+            role_summary_records = []  # 每个汇总单元的 info 记录
+            for speaker_name in ordered_speakers:
+                speeches = all_speeches_by_speaker[speaker_name]
+                any_skeptic = any(s['is_skeptic'] for s in speeches)
+                # 质疑者不单独汇总：其内容已并入对应专家的汇总中，跳过
+                if any_skeptic:
+                    continue
+                # 专家（或非质疑者角色）：有对应质疑者时与该质疑者一起汇总为一个结果
+                skeptics_aimed = skeptic_speeches_by_target.get(speaker_name, [])
+                role_label = f"{speaker_name}（与对应质疑者）" if skeptics_aimed else speaker_name
+                # 该角色原始发言文档
+                raw_parts = [f"**发言智能体**: {speaker_name}\n\n"]
+                for idx, sp in enumerate(speeches, 1):
+                    raw_parts.append(f"### 第{sp['round']}轮 发言#{idx}\n\n")
+                    if sp.get('thinking'):
+                        raw_parts.append(f"**思考**: {sp['thinking']}\n\n")
+                    raw_parts.append(f"**内容**: {sp.get('speech', '无')}\n\n")
+                role_raw_content = "".join(raw_parts)
+                # 追加「针对本专家的质疑者」的发言，一起汇总（上面已取 skeptics_aimed）
+                if skeptics_aimed:
+                    corresponding_text = "## 针对本专家的质疑者发言（与上方专家发言一起汇总）\n\n" + format_speech_list(skeptics_aimed)
+                else:
+                    corresponding_text = "## 针对本专家的质疑者发言\n\n（本场无针对本专家的质疑者发言）"
+                raw_content = f"{role_raw_content}\n\n{corresponding_text}"
+
+                section_body = None
+                summary_method = "原文拼接"
+                if get_chat_long is not None:
+                    try:
+                        prompt = f"{LAYER1_PER_ROLE_SUMMARY_PROMPT}\n\n---\n\n## 该发言智能体与对应质疑者的全部发言（一起汇总）\n\n{raw_content}"
+                        llm = get_chat_long(temperature=0.2, streaming=False)
+                        response = llm.invoke(prompt)
+                        body = getattr(response, "content", None) or str(response)
+                        if body and body.strip():
+                            section_body = body.strip()
+                            llm_used = True
+                            summary_method = "LLM汇总"
+                    except Exception as e:
+                        logger.warning("第一层按角色汇总时 LLM 调用失败 [%s]: %s，该单元使用原文拼接", role_label, e)
+                if section_body is None:
+                    section_body = role_raw_content + "\n\n" + corresponding_text
+                # 将该单元（专家+对应质疑者）汇总单独保存到 discuss 目录
+                safe_role_name = re.sub(r'[^\w\u4e00-\u9fa5\-]', '_', speaker_name)
+                role_md_filename = f"layer1_summary_{safe_role_name}_{timestamp}.md"
+                role_md_filepath = os.path.join(discuss_dir, role_md_filename)
+                combined_speech_count = len(speeches) + len(skeptics_aimed)
+                role_doc_content = f"""# {role_label} 汇总
+
+**讨论主题**: {topic}
+**发言数**: {len(speeches)}（智能体）+ {len(skeptics_aimed)}（质疑者）= {combined_speech_count} | **汇总方式**: {summary_method}
+**生成时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+---
+
+{section_body}
+"""
+                try:
+                    with open(role_md_filepath, 'w', encoding='utf-8') as f:
+                        f.write(role_doc_content)
+                    logger.info("第一层汇总 - 已保存汇总到 discuss: %s（发言智能体+对应质疑者一起）", role_md_filename)
+                except Exception as e:
+                    logger.warning("第一层汇总 - 保存汇总文件失败 [%s]: %s", role_label, e)
+                role_record = {
+                    "role": role_label,
+                    "speech_count": combined_speech_count,
+                    "summary_method": summary_method,
+                    "file": role_md_filepath,
+                    "relative_file": os.path.relpath(role_md_filepath, discussion_base_path),
+                }
+                role_summary_records.append(role_record)
+                logger.info(
+                    "第一层汇总 - [%s] 汇总完成 | 发言数: %d | 方式: %s",
+                    role_label, combined_speech_count, summary_method
+                )
+                per_role_sections.append(f"## {role_label}\n\n{section_body}\n\n")
+
+            md.append("\n".join(per_role_sections))
+
+            # ---- 共识与分歧、最终报告（统一拼接在文档末尾） ----
             md.append("## 共识与分歧\n\n")
-            consensus_data = discussion_state.get('consensus_data', {})
             key_points = consensus_data.get('key_points', [])
             if key_points:
                 md.append("### 共识点\n\n")
@@ -693,8 +1211,6 @@ class DiscussionControl:
                     md.append(f"{i}. {d}\n")
                 md.append("\n")
             md.append(f"**整体共识水平**: {consensus_level:.2f}\n\n---\n\n")
-            
-            # ---- 最终报告 ----
             md.append("## 最终报告与行动建议\n\n")
             if final_report:
                 for i, ins in enumerate(final_report.get('key_insights', []), 1):
@@ -703,7 +1219,10 @@ class DiscussionControl:
                 for i, rec in enumerate(final_report.get('action_recommendations', []), 1):
                     md.append(f"{i}. {rec}\n")
                 md.append("\n")
-            md.append("---\n*此文档由圆桌讨论系统自动生成，供第二层实施专家按目录索引查阅。*\n")
+            if llm_used:
+                md.append("---\n*此文档由圆桌讨论系统第一层按「发言智能体与对应质疑者一起」汇总后拼接生成，供第二层实施专家查阅。*\n")
+            else:
+                md.append("---\n*此文档由圆桌讨论系统自动按发言智能体与对应质疑者一起拼接生成，供第二层实施专家查阅。*\n")
             
             # ---- 写入 Markdown（第一层汇总保存到 discuss/） ----
             md_filename = f"layer1_discussion_summary_{timestamp}.md"
@@ -712,11 +1231,11 @@ class DiscussionControl:
                 f.write("".join(md))
             logger.info(f"生成第一层汇总文档: {md_filepath}")
             
-            # ---- JSON 结构化索引 ----
+            # ---- JSON 结构化索引（含每个角色汇总的 info 记录） ----
             json_index = {
                 "document_type": "layer1_discussion_summary",
                 "discussion_id": discussion_state.get('discussion_id', ''),
-                "topic": query,
+                "topic": topic,
                 "generated_at": datetime.now().isoformat(),
                 "summary_md_file": md_filepath,
                 "statistics": {
@@ -725,6 +1244,7 @@ class DiscussionControl:
                     "participants_count": len(participants),
                     "consensus_level": consensus_level
                 },
+                "role_summary_records": role_summary_records,
                 "table_of_contents": {
                     "by_role": {
                         sp_name: {
@@ -744,8 +1264,8 @@ class DiscussionControl:
                 },
                 "consensus_data": {
                     "overall_level": consensus_level,
-                    "key_points": key_points,
-                    "divergences": divergences
+                    "key_points": consensus_data.get("key_points", []),
+                    "divergences": consensus_data.get("divergences", [])
                 },
                 "final_report": {
                     "key_insights": final_report.get('key_insights', []) if final_report else [],
@@ -759,12 +1279,14 @@ class DiscussionControl:
                 json.dump(json_index, f, ensure_ascii=False, indent=2)
             logger.info(f"生成第一层结构化索引: {json_filepath}")
             
-            # 更新 discussion_state
+            # 更新 discussion_state（统一用相对 discussion_base_path 的路径，便于后续与 base 拼接时不会重复 discussion_id）
+            relative_md = os.path.relpath(md_filepath, discussion_base_path)
+            relative_json = os.path.relpath(json_filepath, discussion_base_path)
             discussion_state['layer1_summary'] = {
-                'md_file': md_filepath,
-                'json_index_file': json_filepath,
-                'relative_md_file': os.path.relpath(md_filepath, discussion_base_path),
-                'relative_json_file': os.path.relpath(json_filepath, discussion_base_path),
+                'md_file': relative_md,
+                'json_index_file': relative_json,
+                'relative_md_file': relative_md,
+                'relative_json_file': relative_json,
                 'timestamp': timestamp,
                 'statistics': json_index['statistics'],
                 'table_of_contents': json_index['table_of_contents']
@@ -774,6 +1296,302 @@ class DiscussionControl:
             
         except Exception as e:
             logger.error(f"生成第一层汇总文档失败: {e}", exc_info=True)
+            return None
+
+    def _run_implementation_task_analysis_agent(
+        self,
+        discussion_base_path: str,
+        first_layer_output: dict,
+    ) -> Optional[str]:
+        """
+        第二层实施任务分析智能体（方案实施架构师）：阅读第一层汇总文档与索引，
+        使用长文本大模型输出任务分解清单、RACI 角色分配表、人力资源配置表，保存到 implement/。
+        
+        Returns:
+            生成的 Markdown 文件路径，未执行或失败时返回 None。
+        """
+        layer1_summary = first_layer_output.get("layer1_summary") or {}
+        rel_md = layer1_summary.get("relative_md_file")
+        rel_json = layer1_summary.get("relative_json_file")
+        md_file = layer1_summary.get("md_file") or rel_md
+        json_file = layer1_summary.get("json_index_file") or rel_json
+        if not md_file or not json_file:
+            logger.info("第一层汇总文档或索引缺失，跳过实施任务分析智能体")
+            return None
+        base = os.path.abspath(discussion_base_path)
+        # 优先用 relative_* 与 base 拼接，避免 md_file 含 "discussion/xxx/..." 时拼接出重复路径
+        if rel_md and not os.path.isabs(rel_md):
+            md_path = os.path.join(base, rel_md)
+        elif md_file and os.path.isabs(md_file):
+            md_path = md_file
+        elif md_file and 'discuss' in md_file:
+            md_path = os.path.join(base, md_file[md_file.find('discuss'):])
+        else:
+            md_path = os.path.join(base, md_file)
+        if rel_json and not os.path.isabs(rel_json):
+            json_path = os.path.join(base, rel_json)
+        elif json_file and os.path.isabs(json_file):
+            json_path = json_file
+        elif json_file and 'discuss' in json_file:
+            json_path = os.path.join(base, json_file[json_file.find('discuss'):])
+        else:
+            json_path = os.path.join(base, json_file)
+        if not os.path.isfile(md_path):
+            logger.warning("第一层汇总文档不存在: %s", md_path)
+            return None
+        if not os.path.isfile(json_path):
+            logger.warning("第一层汇总索引不存在: %s", json_path)
+            return None
+        if get_chat_long is None:
+            logger.warning("get_chat_long 不可用，跳过实施任务分析智能体")
+            return None
+        try:
+            with open(md_path, "r", encoding="utf-8") as f:
+                md_content = f.read()
+            with open(json_path, "r", encoding="utf-8") as f:
+                index_data = json.load(f)
+            index_str = json.dumps(index_data, ensure_ascii=False, indent=2)
+            prompt = f"""{IMPLEMENTATION_TASK_ANALYSIS_AGENT_PROMPT}
+
+## 第一层圆桌讨论汇总文档
+
+{md_content}
+
+## 第一层汇总文档索引（JSON）
+
+```json
+{index_str}
+```
+"""
+            prompt_len = len(prompt)
+            logger.info("任务分析智能体：正在调用长文本模型（输入约 %d 字符），请稍候...", prompt_len)
+            llm = get_chat_long(temperature=0.2, streaming=False)
+            # 长文本调用可能较久，放入线程并设超时（10 分钟），避免主流程无限阻塞
+            _task_analysis_timeout = 600
+            try:
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    future = pool.submit(llm.invoke, prompt)
+                    response = future.result(timeout=_task_analysis_timeout)
+            except FuturesTimeoutError:
+                logger.warning("任务分析智能体调用长文本模型超时（%d 秒），请检查网络或模型服务", _task_analysis_timeout)
+                return None
+            body = getattr(response, "content", None) or str(response)
+            if not body or not body.strip():
+                logger.warning("实施任务分析智能体返回为空")
+                return None
+            impl_dir = os.path.join(base, "implement")
+            os.makedirs(impl_dir, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            out_filename = f"implementation_task_analysis_{timestamp}.md"
+            out_filepath = os.path.join(impl_dir, out_filename)
+            with open(out_filepath, "w", encoding="utf-8") as f:
+                f.write("# 实施任务分析（方案实施架构师）\n\n")
+                f.write(f"**生成时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n---\n\n")
+                f.write(body.strip())
+            logger.info("实施任务分析智能体已生成: %s", out_filepath)
+            first_layer_output["implementation_task_analysis_file"] = out_filepath
+            return out_filepath
+        except Exception as e:
+            logger.warning("实施任务分析智能体执行失败: %s", e, exc_info=True)
+            return None
+
+    def _run_implementation_role_arrangement_agent(
+        self,
+        discussion_base_path: str,
+        first_layer_output: dict,
+    ) -> Optional[str]:
+        """
+        第二层角色安排智能体：根据「任务分析与人员要求」文档抽取需要的人员角色，输出 JSON，
+        供表格解析失败时由第二层据此创建对应智能体。
+        Returns:
+            生成的 JSON 文件路径，未执行或失败时返回 None。
+        """
+        task_analysis_file = first_layer_output.get("implementation_task_analysis_file") or ""
+        if not task_analysis_file or not os.path.isfile(task_analysis_file):
+            return None
+        if get_chat_long is None:
+            logger.warning("get_chat_long 不可用，跳过角色安排智能体")
+            return None
+        base = os.path.abspath(discussion_base_path)
+        if not os.path.isabs(task_analysis_file):
+            task_analysis_file = os.path.join(base, task_analysis_file)
+        if not os.path.isfile(task_analysis_file):
+            return None
+        try:
+            with open(task_analysis_file, "r", encoding="utf-8") as f:
+                doc_content = f.read()
+            prompt = f"""{IMPLEMENTATION_ROLE_ARRANGEMENT_AGENT_PROMPT}
+
+## 任务分析与人员要求文档（全文）
+
+{doc_content}
+"""
+            llm = get_chat_long(temperature=0.2, streaming=False)
+            response = llm.invoke(prompt)
+            body = (getattr(response, "content", None) or str(response) or "").strip()
+            if not body:
+                logger.warning("角色安排智能体返回为空")
+                return None
+            # 抽取 JSON 数组：允许被 ```json ... ``` 包裹
+            import re as _re
+            m = _re.search(r'\[\s*\{[\s\S]*\}\s*\]', body)
+            if not m:
+                logger.warning("角色安排智能体未返回有效 JSON 数组")
+                return None
+            raw = m.group()
+            raw_clean = _re.sub(r'[\x00-\x1f]', ' ', raw)
+            arr = json.loads(raw_clean)
+            if not isinstance(arr, list) or len(arr) == 0:
+                logger.warning("角色安排智能体返回非列表或空列表")
+                return None
+            # 标准化为 roles_with_tasks 格式
+            out_roles = []
+            for item in arr:
+                if not isinstance(item, dict):
+                    continue
+                role_name = (item.get("role_name") or item.get("name") or "").strip() or "实施角色"
+                out_roles.append({
+                    "role_name": role_name,
+                    "role_description": (item.get("role_description") or item.get("description") or role_name).strip(),
+                    "layer": (item.get("layer") or "").strip(),
+                    "professional_domain": (item.get("professional_domain") or item.get("domain") or role_name).strip(),
+                    "tasks": list(item.get("tasks") or []),
+                    "skills": list(item.get("skills") or item.get("expertise") or []),
+                })
+            if not out_roles:
+                return None
+            impl_dir = os.path.join(base, "implement")
+            os.makedirs(impl_dir, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            out_filename = f"implementation_role_arrangement_{timestamp}.json"
+            out_filepath = os.path.join(impl_dir, out_filename)
+            with open(out_filepath, "w", encoding="utf-8") as f:
+                json.dump(out_roles, f, ensure_ascii=False, indent=2)
+            logger.info("角色安排智能体已生成: %s，共 %d 个角色", out_filepath, len(out_roles))
+            first_layer_output["implementation_role_arrangement_file"] = out_filepath
+            return out_filepath
+        except Exception as e:
+            logger.warning("角色安排智能体执行失败: %s", e, exc_info=True)
+            return None
+
+    def _save_layer2_results_to_concretization(
+        self,
+        discussion_base_path: str,
+        result,
+    ) -> List[str]:
+        """
+        将第二层各角色执行结果保存到 concretization/（仅用于任务分析驱动流程）。
+        Returns:
+            已保存的 .md 文件路径列表
+        """
+        saved_paths = []
+        conc_dir = os.path.join(os.path.abspath(discussion_base_path), "concretization")
+        os.makedirs(conc_dir, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        for i, prop in enumerate(result.expert_proposals or []):
+            name = prop.get("expert_name") or prop.get("domain") or f"role_{i}"
+            safe = re.sub(r'[^\w\u4e00-\u9fa5]', '_', str(name)[:50])
+            fn = f"impl_role_{safe}_{ts}.md"
+            filepath = os.path.join(conc_dir, fn)
+            try:
+                with open(filepath, "w", encoding="utf-8") as f:
+                    f.write(f"# 实施角色：{name}\n\n")
+                    f.write(f"**领域/角色**: {prop.get('domain', '')}\n\n---\n\n")
+                    f.write(prop.get("content", ""))
+                saved_paths.append(filepath)
+            except Exception as ex:
+                logger.warning("保存角色执行结果到 concretization 失败 %s: %s", name, ex)
+        if saved_paths:
+            logger.info("第二层角色执行结果已保存到 concretization/: %d 个文件", len(saved_paths))
+        return saved_paths
+
+    def _run_implementation_summary_agent(
+        self,
+        discussion_base_path: str,
+        expert_proposals: List[Dict[str, Any]],
+    ) -> Optional[str]:
+        """
+        实施文档汇总智能体：阅读各角色执行结果，使用长文本大模型生成实施文档，保存到 concretization/。
+        Returns:
+            生成的实施文档 .md 路径，失败或未配置长文本模型时返回 None。
+        """
+        if not expert_proposals:
+            return None
+        if get_chat_long is None:
+            logger.warning("get_chat_long 不可用，跳过实施文档汇总智能体")
+            return None
+        try:
+            parts = []
+            for i, prop in enumerate(expert_proposals, 1):
+                name = prop.get("expert_name") or prop.get("domain") or f"角色{i}"
+                parts.append(f"## 角色 {i}：{name}\n\n")
+                parts.append(prop.get("content", "") or "(无内容)\n")
+                parts.append("\n\n---\n\n")
+            body = "".join(parts)
+            prompt = f"""{LAYER2_IMPLEMENTATION_SUMMARY_AGENT_PROMPT}
+
+## 各角色实施执行结果
+
+{body}
+"""
+            llm = get_chat_long(temperature=0.2, streaming=False)
+            response = llm.invoke(prompt)
+            text = getattr(response, "content", None) or str(response)
+            if not text or not text.strip():
+                logger.warning("实施文档汇总智能体返回为空")
+                return None
+            conc_dir = os.path.join(os.path.abspath(discussion_base_path), "concretization")
+            os.makedirs(conc_dir, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            out_path = os.path.join(conc_dir, f"implementation_summary_{ts}.md")
+            with open(out_path, "w", encoding="utf-8") as f:
+                f.write("# 实施文档（汇总）\n\n")
+                f.write(f"**生成时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n---\n\n")
+                f.write(text.strip())
+            logger.info("实施文档汇总智能体已生成: %s", out_path)
+            return out_path
+        except Exception as e:
+            logger.warning("实施文档汇总智能体执行失败: %s", e, exc_info=True)
+            return None
+
+    def _save_plan_summary_to_concretization(
+        self,
+        discussion_base_path: str,
+        result,
+        discussion_state: Optional[dict] = None,
+    ) -> Optional[str]:
+        """
+        将第二层「根据分类的角色发言汇总」（方案汇总智能体/按类汇总结果）保存到 concretization/。
+        当发言数>5 时为先角色分类再按类汇总的 consolidated 内容；否则为累计汇总内容。
+        优先使用 result.plan_summary_consolidated / result.plan_summary_file，若无则从 discussion_state.plan_summary_agent_file 读取。
+        Returns:
+            保存后的 .md 文件路径，未保存时返回 None。
+        """
+        content = getattr(result, "plan_summary_consolidated", None) or ""
+        plan_file = getattr(result, "plan_summary_file", None) or (discussion_state or {}).get("plan_summary_agent_file")
+        if not content and plan_file:
+            base = os.path.abspath(discussion_base_path)
+            abs_path = os.path.join(base, plan_file) if plan_file and not os.path.isabs(plan_file) else plan_file
+            if abs_path and os.path.isfile(abs_path):
+                try:
+                    with open(abs_path, "r", encoding="utf-8") as f:
+                        content = f.read()
+                except Exception as e:
+                    logger.warning("读取方案汇总文件失败: %s", e)
+        if not content or not content.strip():
+            return None
+        try:
+            conc_dir = os.path.join(os.path.abspath(discussion_base_path), "concretization")
+            os.makedirs(conc_dir, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            out_path = os.path.join(conc_dir, f"plan_summary_by_category_{ts}.md")
+            with open(out_path, "w", encoding="utf-8") as f:
+                f.write("# 方案汇总（按分类角色发言汇总）\n\n")
+                f.write(f"**生成时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n---\n\n")
+                f.write(content.strip())
+            return out_path
+        except Exception as e:
+            logger.warning("保存分类汇总到 concretization 失败: %s", e)
             return None
 
     def _save_discussion_state(self, discussion_base_path: str, state_data: dict):
@@ -962,14 +1780,26 @@ class DiscussionControl:
             final_report = discussion_state.get("final_report", {})
             decision_output = self._convert_to_decision_output(discussion_state, final_report, query)
             self._run_implementation_layer(decision_output, discussion_state, discussion_base_path)
-            self._run_concretization_layer(discussion_base_path, discussion_state.get("discussion_id", ""))
-            discussion_state["concretization_layer"] = {"status": "completed", "timestamp": datetime.now().isoformat()}
+            conc_result = self._run_concretization_layer(discussion_base_path, discussion_state.get("discussion_id", ""))
+            discussion_state["concretization_layer"] = {
+                "status": "completed",
+                "timestamp": datetime.now().isoformat(),
+                "processed_experts": conc_result.get("processed_experts", []),
+            }
+            if conc_result.get("output_files"):
+                discussion_state["concretization_summary_output_files"] = conc_result["output_files"]
             self._save_discussion_state(discussion_base_path, discussion_state)
         elif modified_layer == 2:
             discussion_state.pop("concretization_layer", None)
             self._save_discussion_state(discussion_base_path, discussion_state)
-            self._run_concretization_layer(discussion_base_path, discussion_state.get("discussion_id", ""))
-            discussion_state["concretization_layer"] = {"status": "completed", "timestamp": datetime.now().isoformat()}
+            conc_result = self._run_concretization_layer(discussion_base_path, discussion_state.get("discussion_id", ""))
+            discussion_state["concretization_layer"] = {
+                "status": "completed",
+                "timestamp": datetime.now().isoformat(),
+                "processed_experts": conc_result.get("processed_experts", []),
+            }
+            if conc_result.get("output_files"):
+                discussion_state["concretization_summary_output_files"] = conc_result["output_files"]
             self._save_discussion_state(discussion_base_path, discussion_state)
 
         self._build_speech_search_index(discussion_base_path)
@@ -993,12 +1823,12 @@ class DiscussionControl:
 
     def _save_agent_config(self, discussion_base_path: str, agent_name: str, agent_config: dict):
         """
-        保存智能体配置到 roles 目录
+        保存智能体配置到 roles 目录，并单独保存该角色的 prompt 到同目录的 .md 文件。
         
         Args:
             discussion_base_path: 讨论文件夹路径
             agent_name: 智能体名称
-            agent_config: 智能体配置字典（可能含 DomainExpert 等对象，会先转为可序列化）
+            agent_config: 智能体配置字典（可能含 role_prompt、DomainExpert 等，会先转为可序列化）
         """
         try:
             config_serializable = self._make_config_json_serializable(agent_config)
@@ -1010,7 +1840,17 @@ class DiscussionControl:
             json_filepath = os.path.join(roles_dir, json_filename)
             with open(json_filepath, 'w', encoding='utf-8') as f:
                 json.dump(config_serializable, f, ensure_ascii=False, indent=2)
-            logger.info(f"保存智能体配置: {json_filepath}")
+            logger.info(f"保存智能体配置到 roles: {json_filepath}")
+            # 第二层创建的角色对应的 prompt 保存到 roles 目录：JSON 中已含 role_prompt，再单独写一份 .md 便于查看与复用
+            role_prompt = agent_config.get("role_prompt") if isinstance(agent_config, dict) else None
+            if role_prompt and isinstance(role_prompt, str) and role_prompt.strip():
+                prompt_filename = f"{safe_agent_name}_{timestamp}_prompt.md"
+                prompt_filepath = os.path.join(roles_dir, prompt_filename)
+                with open(prompt_filepath, 'w', encoding='utf-8') as f:
+                    f.write(f"# {agent_name} - 角色 Prompt\n\n")
+                    f.write(f"**保存时间**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n---\n\n")
+                    f.write(role_prompt.strip())
+                logger.info(f"保存角色 prompt 到: {prompt_filepath}")
             return json_filepath
         except Exception as e:
             logger.error(f"保存智能体配置失败: {e}")
@@ -1040,9 +1880,10 @@ class DiscussionControl:
             
             discussion_base_path = os.path.join("discussion", discussion_id)
             
-            # 创建文件夹结构：discuss/ 第一层讨论发言；implement/ 第二层实施方案；concretization/ 第三层具像化
+            # 创建文件夹结构：discuss/ 第一层；implement/ 第二层；inspect/ 检验层输出；concretization/ 第三层具像化
             os.makedirs(os.path.join(discussion_base_path, "discuss"), exist_ok=True)
             os.makedirs(os.path.join(discussion_base_path, "implement"), exist_ok=True)
+            os.makedirs(os.path.join(discussion_base_path, "inspect"), exist_ok=True)
             os.makedirs(os.path.join(discussion_base_path, "concretization"), exist_ok=True)
             os.makedirs(os.path.join(discussion_base_path, "code"), exist_ok=True)
             os.makedirs(os.path.join(discussion_base_path, "images"), exist_ok=True)
@@ -1385,19 +2226,24 @@ class DiscussionControl:
             while round_number <= max_rounds:
                 logger.info(f"🔄 第 {round_number} 轮讨论开始")
 
-                # 本轮已发言的智能体（重启时从状态恢复，避免重复发言）
+                # 本轮已发言的智能体（重启时从状态恢复，避免重复发言；优先 rounds，并合并 layer1.speeches）
                 already_spoken = set()
                 rounds_list = discussion_state.get("rounds") or []
                 if round_number <= len(rounds_list):
                     round_data = rounds_list[round_number - 1]
                     already_spoken = {s.get("speaker") for s in round_data.get("speeches", []) if s.get("speaker")}
+                layer1_speeches = (discussion_state.get("layer1") or {}).get("speeches") or []
+                for rec in layer1_speeches:
+                    if rec.get("round_number") == round_number and rec.get("speaker"):
+                        already_spoken.add(rec["speaker"])
                 if already_spoken:
-                    logger.info(f"第 {round_number} 轮已发言智能体（将跳过）: {already_spoken}")
+                    logger.info(f"第 {round_number} 轮已发言智能体（将跳过，避免重复执行）: {already_spoken}")
 
                 # 执行一轮讨论
                 round_complete = False
-                has_speeches = False
-                
+                # 若本轮在 state 中已有发言（恢复场景），视为本轮已有发言，避免误报「没有产生任何发言」
+                has_speeches = bool(round_number <= len(rounds_list) and (rounds_list[round_number - 1].get("speeches")))
+
                 for step_result in discussion_system.conduct_discussion_round(round_number, already_spoken_speakers=already_spoken):
                     if "error" in step_result:
                         logger.error(f"❌ 讨论轮次错误: {step_result['error']}")
@@ -1641,13 +2487,25 @@ class DiscussionControl:
                             round_data['round_number'] = round_number
                             round_data['status'] = 'in_progress'
                             round_data['updated_at'] = datetime.now().isoformat()
-                            
+                            # 第一层发言记录：统一写入 layer1.speeches，任务再次启动时可据此避免重复执行
+                            if 'layer1' not in discussion_state:
+                                discussion_state['layer1'] = {}
+                            if 'speeches' not in discussion_state['layer1']:
+                                discussion_state['layer1']['speeches'] = []
+                            discussion_state['layer1']['speeches'].append({
+                                "speaker": speaker,
+                                "round_number": round_number,
+                                "relative_file_path": speech_data["relative_file_path"],
+                                "relative_json_path": speech_data["relative_json_path"],
+                                "timestamp": timestamp,
+                                "datetime": speech_data["datetime"],
+                            })
+                            discussion_state['layer1']['updated_at'] = datetime.now().isoformat()
                             # 更新discussion_state的updated_at
                             discussion_state['updated_at'] = datetime.now().isoformat()
-                            
                             # 保存更新后的状态
                             self._save_discussion_state(discussion_base_path, discussion_state)
-                            logger.info(f"已更新discussion_state.json，添加{speaker}的发言到第{round_number}轮")
+                            logger.info(f"已更新discussion_state.json，添加{speaker}的发言到第{round_number}轮（已记录至 layer1.speeches，再次启动将跳过该角色）")
                         except Exception as e:
                             logger.error(f"更新discussion_state失败: {e}", exc_info=True)
 
@@ -1928,65 +2786,86 @@ class DiscussionControl:
                     round_number += 1
                     continue  # 继续下一轮
 
-            # 如果循环正常结束（达到最大轮次），生成最终报告
-            try:
-                logger.info("📄 正在生成最终讨论报告...")
-
-                final_report = discussion_system.generate_final_report()
-                
-                if final_report:
-                    consensus_report = final_report.get('consensus_report', {})
-                    overall_consensus = consensus_report.get('overall_consensus', {}) if isinstance(consensus_report, dict) else {}
-                    consensus_level = overall_consensus.get('overall_level', 0.0) if isinstance(overall_consensus, dict) else 0.0
-                    consensus_analysis = overall_consensus.get('analysis', '未分析') if isinstance(overall_consensus, dict) else '未分析'
-                    
-                    logger.info(f"🎭 圆桌讨论最终报告 - 讨论主题: {final_report.get('discussion_topic', '未指定')}, 总轮次: {final_report.get('total_rounds', 0)}, 最终共识水平: {consensus_level:.2f}")
-                    
-                    # 更新会议状态为完成
-                    discussion_state['status'] = 'completed'
-                    discussion_state['consensus_data']['overall_level'] = consensus_level
-                    discussion_state['final_report'] = {
-                        'total_rounds': final_report.get('total_rounds', 0),
-                        'consensus_level': consensus_level,
-                        'key_insights': final_report.get('key_insights', []),
-                        'action_recommendations': final_report.get('action_recommendations', [])
-                    }
-                    self._save_discussion_state(discussion_base_path, discussion_state)
-                    
-                    # 更新任务状态为已完成
-                    if session_id and discussion_id:
-                        try:
-                            cSingleSqlite.update_discussion_task_status(
-                                session_id=session_id,
-                                discussion_id=discussion_id,
-                                task_status='completed'
-                            )
-                            logger.info(f"更新任务状态为已完成: session_id={session_id}, discussion_id={discussion_id}")
-                        except Exception as e:
-                            logger.warning(f"更新任务状态失败: {e}")
-                else:
-                    logger.warning("⚠️ 无法生成最终报告")
-            except Exception as e:
-                logger.error(f"生成最终报告失败: {str(e)}", exc_info=True)
-                logger.warning(f"⚠️ 生成最终报告时出错: {str(e)}")
+            # 如果循环正常结束（达到最大轮次），确保有最终报告与第一层汇总（再次启动时若缺失则补充）
+            final_report = None
+            if discussion_state.get('status') == 'completed' and discussion_state.get('final_report'):
+                # 再次启动：第一层已在之前完成，直接使用状态中的最终报告
+                final_report = discussion_state['final_report']
+                logger.info("📄 第一层已完成，使用已有最终报告")
+            else:
+                try:
+                    logger.info("📄 正在生成最终讨论报告...")
+                    gen_report = discussion_system.generate_final_report()
+                    if gen_report:
+                        consensus_report = gen_report.get('consensus_report', {})
+                        overall_consensus = consensus_report.get('overall_consensus', {}) if isinstance(consensus_report, dict) else {}
+                        consensus_level = overall_consensus.get('overall_level', 0.0) if isinstance(overall_consensus, dict) else 0.0
+                        logger.info(f"🎭 圆桌讨论最终报告 - 讨论主题: {gen_report.get('discussion_topic', '未指定')}, 总轮次: {gen_report.get('total_rounds', 0)}, 最终共识水平: {consensus_level:.2f}")
+                        discussion_state['status'] = 'completed'
+                        discussion_state['consensus_data']['overall_level'] = consensus_level
+                        final_report = {
+                            'total_rounds': gen_report.get('total_rounds', 0),
+                            'consensus_level': consensus_level,
+                            'key_insights': gen_report.get('key_insights', []),
+                            'action_recommendations': gen_report.get('action_recommendations', [])
+                        }
+                        discussion_state['final_report'] = final_report
+                        self._save_discussion_state(discussion_base_path, discussion_state)
+                        if session_id and discussion_id:
+                            try:
+                                cSingleSqlite.update_discussion_task_status(
+                                    session_id=session_id,
+                                    discussion_id=discussion_id,
+                                    task_status='completed'
+                                )
+                                logger.info(f"更新任务状态为已完成: session_id={session_id}, discussion_id={discussion_id}")
+                            except Exception as e:
+                                logger.warning(f"更新任务状态失败: {e}")
+                    else:
+                        logger.warning("⚠️ 无法生成最终报告")
+                except Exception as e:
+                    logger.error(f"生成最终报告失败: {str(e)}", exc_info=True)
+                    logger.warning(f"⚠️ 生成最终报告时出错: {str(e)}")
+                if not final_report:
+                    final_report = discussion_state.get('final_report', {})
 
             logger.info("✅ 第一层：圆桌讨论完成！")
             
             # ==================================================
-            # 生成第一层汇总文档（带目录索引，供第二层使用）
+            # 先完成第一层汇总，再进入第二层（确保第一层汇总文档存在；缺失则补充后再跑第二层）
+            # 路径解析：优先用 relative_md_file（相对 discussion_base_path），避免 md_file 含 "discussion/xxx" 时与 base 拼接成重复路径
             # ==================================================
-            try:
-                final_report_for_summary = final_report if 'final_report' in locals() and final_report else {}
-                summary_path = self._generate_layer1_summary_document(
-                    discussion_base_path, discussion_state, final_report_for_summary, query
-                )
-                if summary_path:
-                    logger.info(f"📚 第一层汇总文档已生成: {summary_path}")
-                    self._save_discussion_state(discussion_base_path, discussion_state)
-                else:
-                    logger.warning("⚠️ 第一层汇总文档生成失败")
-            except Exception as summary_error:
-                logger.error(f"生成第一层汇总文档异常: {summary_error}")
+            layer1_meta = discussion_state.get('layer1_summary') or {}
+            rel_md = layer1_meta.get('relative_md_file')
+            abs_or_rel_md = layer1_meta.get('md_file') or rel_md
+            if rel_md and not os.path.isabs(rel_md):
+                md_path = os.path.join(discussion_base_path, rel_md)
+            elif abs_or_rel_md and os.path.isabs(abs_or_rel_md):
+                md_path = abs_or_rel_md
+            elif abs_or_rel_md and ('discuss' in abs_or_rel_md or abs_or_rel_md.startswith('discuss')):
+                # md_file 可能是 "discussion/xxx/discuss/..." 或 "discuss/..."，只取 discuss/ 及以后与 base 拼接
+                tail = abs_or_rel_md[abs_or_rel_md.find('discuss'):] if 'discuss' in abs_or_rel_md else abs_or_rel_md
+                md_path = os.path.join(discussion_base_path, tail)
+            else:
+                md_path = os.path.join(discussion_base_path, abs_or_rel_md) if abs_or_rel_md else ''
+            need_summary = not md_path or not os.path.isfile(md_path)
+            if need_summary:
+                try:
+                    final_report_for_summary = final_report or discussion_state.get('final_report', {})
+                    # 主题优先从 discussion_state.json 的 topic 读取，避免使用当前聊天内容（如「xxx 任务启动」）
+                    topic_for_summary = (discussion_state.get('topic') or '').strip() or query
+                    summary_path = self._generate_layer1_summary_document(
+                        discussion_base_path, discussion_state, final_report_for_summary, topic_for_summary
+                    )
+                    if summary_path:
+                        logger.info(f"📚 第一层汇总文档已生成: {summary_path}")
+                        self._save_discussion_state(discussion_base_path, discussion_state)
+                    else:
+                        logger.warning("⚠️ 第一层汇总文档生成失败")
+                except Exception as summary_error:
+                    logger.error(f"生成第一层汇总文档异常: {summary_error}")
+            else:
+                logger.info("第一层汇总文档已存在，跳过生成（再次启动无需重复汇总）")
             
             # ==================================================
             # 第二层: 实施讨论组（重复启动时若已完成则跳过；智能体与发言状态见 discussion_state['layer2']/implementation_layer）
@@ -2004,7 +2883,7 @@ class DiscussionControl:
                 # 将第一层结果转换为 DecisionOutput
                 decision_output = self._convert_to_decision_output(
                     discussion_state,
-                    final_report if 'final_report' in locals() and final_report else {},
+                    final_report or {},
                     query
                 )
 
@@ -2021,15 +2900,40 @@ class DiscussionControl:
                     impl_outputs, impl_result = [], None
 
                 # 第三层：仅在本层未完成时运行（依赖 implement/，第二层跳过时仍可执行）
+                # 支持部分恢复：从 discussion_state 中获取已处理的专家列表
                 if (decision_output.tasks and not conc_done):
-                    self._run_concretization_layer(
+                    # 获取已处理的专家列表（用于任务恢复时跳过）
+                    layer3_state = discussion_state.get("concretization_layer") or {}
+                    processed_experts_names = [
+                        p.get("base_name") for p in layer3_state.get("processed_experts", [])
+                        if p.get("base_name") and p.get("status") == "completed"
+                    ]
+                    
+                    conc_result = self._run_concretization_layer(
                         discussion_base_path,
                         discussion_state.get("discussion_id", ""),
+                        processed_experts=processed_experts_names,
                     )
+                    
+                    # 合并已处理的专家列表（已有 + 本次新处理）
+                    existing_processed = layer3_state.get("processed_experts", [])
+                    new_processed = conc_result.get("processed_experts", [])
+                    all_processed = existing_processed + [
+                        p for p in new_processed
+                        if p.get("status") == "completed" and p.get("base_name") not in processed_experts_names
+                    ]
+                    
                     discussion_state["concretization_layer"] = {
                         "status": "completed",
                         "timestamp": datetime.now().isoformat(),
+                        "processed_experts": all_processed,
                     }
+                    if conc_result.get("output_files"):
+                        # 合并输出文件列表
+                        existing_files = discussion_state.get("concretization_summary_output_files", [])
+                        new_files = conc_result["output_files"]
+                        all_files = existing_files + [f for f in new_files if f not in existing_files]
+                        discussion_state["concretization_summary_output_files"] = all_files
                     self._save_discussion_state(discussion_base_path, discussion_state)
                 elif not decision_output.tasks:
                     logger.info("⚠️ 没有可执行任务，跳过实施层与具像化层")

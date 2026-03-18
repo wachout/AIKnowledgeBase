@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 """
 领域专家智能体
-提供专业观点和技术方案
+提供专业观点和技术方案。自动生成角色时参考 expert_role_prompt_template 中的结构（Role/Background/Profile/Skills/Goals/Workflow 等）。
 """
 
 import json
 import logging
 from typing import Dict, Any, List, Optional
 from .base_agent import BaseAgent, WorkingStyle
+from .expert_role_prompt_template import build_expert_role_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +56,15 @@ class DomainExpert(BaseAgent):
         # 专家特有属性
         self.domain = domain
         self.expertise_area = expertise_area
+        # 按参考模板生成完整角色提示词（圆桌自动生成智能体时与 expert_role_prompt_template 结构一致）
+        self.role_prompt = build_expert_role_prompt(
+            role_name=f"{domain}领域专家",
+            domain=domain,
+            expertise_area=expertise_area,
+            skills=professional_skills,
+            behavior_guidelines=behavior_guidelines,
+            output_format=output_format,
+        )
         self.expertise_score = 0.0  # 专业性评分
         self.collaboration_score = 0.0  # 协作评分
 
@@ -326,8 +336,11 @@ class DomainExpert(BaseAgent):
             return self._create_fallback_expertise(topic, context)
 
     def _build_expertise_prompt(self, topic: str, context: Dict[str, Any]) -> str:
-        """构建专业意见提示"""
-        prompt = f"""你是一位{self.domain}领域的{self.expertise_area}专家。请基于你的专业知识提供深入分析和建议。
+        """构建专业意见提示（角色部分采用与 expert_role_prompt_template 一致的结构）"""
+        prompt = f"""{self.role_prompt}
+
+---
+## 当前任务
 
 **讨论主题：**
 {topic}
@@ -335,34 +348,14 @@ class DomainExpert(BaseAgent):
 **当前上下文：**
 {json.dumps(context, ensure_ascii=False, indent=2)}
 
-**你的专业背景：**
-领域：{self.domain}
-专长：{self.expertise_area}
-工作风格：{self.working_style.value}
-
-**专业技能：**
-{chr(10).join(f"- {skill}" for skill in self.professional_skills)}
-
 **分析要求：**
+1. 专业视角：基于{self.domain}与{self.expertise_area}分析该主题的核心问题
+2. 技术深度：提供技术层面的深入见解与分析
+3. 实际可行性：考虑实际约束与技术可行性
+4. 创新建议：提出创新性的解决方案或思路
+5. 风险评估：识别潜在的技术风险与挑战
 
-### 1. 专业视角分析
-基于你的{self.domain}专业背景，分析该主题的核心问题。
-
-### 2. 技术深度
-提供技术层面的深入见解和分析。
-
-### 3. 实际可行性
-考虑实际约束和技术可行性。
-
-### 4. 创新建议
-提出创新性的解决方案或思路。
-
-### 5. 风险评估
-识别潜在的技术风险和挑战。
-
-{self.output_format}
-
-请提供专业、深入、有价值的分析和建议。"""
+请按上述角色设定与 OutputFormat 提供专业、深入、有价值的分析和建议。"""
 
         return prompt
 
@@ -452,6 +445,12 @@ class DomainExpert(BaseAgent):
         Returns:
             与 speak() 同结构的发言结果字典（content 为修订后的完整发言）
         """
+        revision_reminder = ""
+        if revision_round >= 2:
+            revision_reminder = """
+**第二层修订提醒（务必遵守）：** 在专业领域不违背第一性原理、逻辑可推理、可实施执行的前提下，请特别注重**实施的可行性、步骤的详细度，避免空理论**。若质疑者已提供具体参数、指标或数据，请在修订稿中**明确吸纳并体现**（如写入具体数值、时间节点、验收标准等），使方案可落地、可执行。
+"""
+
         prompt = f"""你是{self.role_definition}，具备以下专业技能：
 {chr(10).join(f"- {s}" for s in self.professional_skills)}
 
@@ -460,12 +459,13 @@ class DomainExpert(BaseAgent):
 
 **质疑者对你提出的质疑/建议（请认真对待并据此完善）：**
 {skeptic_challenge}
-
+{revision_reminder}
 **任务：** 请根据质疑者的意见，对上述发言进行完善和修改。要求：
 1. 保留你仍坚持的合理观点，对质疑中合理的部分进行补充、修正或澄清。
 2. 对质疑中的误解予以简要澄清，对建设性建议予以吸纳。
 3. 输出为一份完整、连贯的修订后发言（不要只写修改片段），可直接作为你在本轮讨论中的正式发言。
 4. 保持专业、客观，篇幅适中。
+5. **思维与边界**：可在**本领域内**突破思维、创新完成任务；但在**角色领域内**不要随意突破边界，勿越界到其他专业。
 
 请直接输出修订后的完整发言内容，不要加「修订版」「回应如下」等前缀。"""
 

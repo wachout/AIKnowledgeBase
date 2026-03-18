@@ -40,6 +40,9 @@ class TaskAnalysis:
         self.risk_factors = []
         self.mitigation_strategies = []
 
+        # 自主构思：研究假设（科学意义且可检验，经进化策略平衡新颖性与可行性）
+        self.research_hypotheses = []
+
     def set_core_analysis(self, core_problem: str, sub_problems: List[str],
                          complexity: str, time_estimate: str):
         """设置核心问题分析"""
@@ -72,6 +75,10 @@ class TaskAnalysis:
         self.risk_factors = risk_factors.copy()
         self.mitigation_strategies = mitigation_strategies.copy()
 
+    def set_research_hypotheses(self, hypotheses: List[Dict[str, Any]]):
+        """设置自主构思产出的研究假设列表（每项含 text, novelty_score, feasibility_score, testability_criteria 等）"""
+        self.research_hypotheses = [dict(h) for h in hypotheses]
+
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典"""
         return {
@@ -101,7 +108,11 @@ class TaskAnalysis:
             "risk_analysis": {
                 "risk_factors": self.risk_factors,
                 "mitigation_strategies": self.mitigation_strategies
-            }
+            },
+            "research_hypotheses": self.research_hypotheses,
+            "ideation_ideas": getattr(self, "ideation_ideas", []),
+            "ideation_papers": getattr(self, "ideation_papers", []),
+            "papers_downloaded_to": getattr(self, "papers_downloaded_to", None),
         }
 
 

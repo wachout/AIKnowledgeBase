@@ -2066,6 +2066,8 @@ class KnowledgeBaseDB():
                         'permission_level': row[7],
                         'url': row[8]
                     })
+                # print(f"文件列表: {result}")
+                #logger.info(f"文件列表: {result}")
                 return result
             return result
         except Exception as e:

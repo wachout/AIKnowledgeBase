@@ -30,6 +30,10 @@ class LLMConfig:
         self.qwen_base_url = os.getenv("QWEN_BASE_URL", "") or os.getenv("LLM_BASE_URL", "")
         self.qwen_model_id = os.getenv("QWEN_MODEL_ID", "") or os.getenv("LLM_MODEL_ID", "")
         self.qwen_model_name = os.getenv("QWEN_MODEL_NAME", "") or os.getenv("LLM_MODEL_NAME", "")
+        self.qwen_model_long = os.getenv("QWEN_MODEL_LONG", "").strip() or self.qwen_model_id  # 长文本模型，未配置时用默认模型
+        # 长模型可单独配 base_url / api_key（仅改模型名时可不配，与默认共用）
+        self.qwen_base_url_long = (os.getenv("QWEN_BASE_URL_LONG", "") or "").strip()
+        self.qwen_api_key_long = (os.getenv("QWEN_API_KEY_LONG", "") or "").strip()
         self.qwen_type = _env_bool("QWEN_TYPE", False)
 
         # MINMAX
@@ -123,6 +127,28 @@ class LLMConfig:
 
         raise ValueError("未找到可用的文本模型配置（QWEN_TYPE 或 MINMAX_TYPE 至少一个为 True 且配置完整）")
 
+    def get_chat_long(self, temperature: float = 0.2, streaming: bool = False):
+        """
+        创建长文本对话模型实例（使用 QWEN_MODEL_LONG，用于需要过长文本输入、不截断的场景）。
+        仅当 QWEN_TYPE=True 时有效；未配置 QWEN_MODEL_LONG 时使用默认 QWEN_MODEL_ID。
+        长模型可与默认模型不同端点：配置 QWEN_BASE_URL_LONG / QWEN_API_KEY_LONG 时优先使用，否则与默认共用。
+        使用 ChatOpenAI 走 OpenAI 兼容接口，避免 ChatTongyi（DashScope 原生 SDK）对部分模型报 url error。
+        """
+        if self._active_text != "qwen":
+            return self.get_chat_tongyi(temperature=temperature, streaming=streaming)
+        base_url = self.qwen_base_url_long or self.qwen_base_url
+        api_key = self.qwen_api_key_long or self.qwen_api_key
+        if not api_key or not base_url:
+            raise ValueError("QWEN 配置不完整（长模型使用 QWEN_BASE_URL_LONG/QWEN_API_KEY_LONG 或 QWEN_BASE_URL/QWEN_API_KEY）")
+        model = self.qwen_model_long or self.qwen_model_id
+        return ChatOpenAI(
+            temperature=temperature,
+            model=model,
+            api_key=api_key,
+            base_url=base_url,
+            streaming=streaming,
+        )
+
     def get_chat_openai(self, temperature: float = 0.7, streaming: bool = False):
         """
         创建 ChatOpenAI 兼容实例（与 get_chat_tongyi 使用同一套启用的文本模型，但统一为 OpenAI 接口）。
@@ -204,6 +230,11 @@ def get_llm_config() -> LLMConfig:
 def get_chat_tongyi(temperature: float = 0.3, streaming: bool = False, enable_thinking: bool = False):
     """便捷函数：根据 QWEN_TYPE / MINMAX_TYPE 获取当前启用的对话模型"""
     return get_llm_config().get_chat_tongyi(temperature, streaming, enable_thinking)
+
+
+def get_chat_long(temperature: float = 0.2, streaming: bool = False):
+    """便捷函数：获取长文本模型（QWEN_MODEL_LONG），用于过长文本输入、取消文本限制的场景"""
+    return get_llm_config().get_chat_long(temperature, streaming)
 
 
 def get_chat_openai(temperature: float = 0.7, streaming: bool = False):

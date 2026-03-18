@@ -26,9 +26,24 @@ from .base_tool import (
 
 # 具体工具类
 from .knowledge_search_tool import KnowledgeSearchTool
-from .web_search_tool import WebSearchTool
+from .web_search_tool import WebSearchTool, WikipediaSearchTool, SemanticScholarSearchTool, ArxivSearchTool, AcademicPaperSearchTool
 from .data_analysis_tool import DataAnalysisTool
 from .communication_tool import CommunicationTool
+
+# 具象化层工具智能体
+from .code_writer_tool import (
+    CodeWriterTool,
+    CodeLanguage,
+    CodeType,
+    CodeGenerationResult
+)
+from .three_d_print_tool import (
+    ThreeDPrintTool,
+    PrintMaterial,
+    DesignType,
+    PrintTechnology,
+    ThreeDDesignResult
+)
 
 # 版本管理
 from .tool_version import (
@@ -100,8 +115,23 @@ __all__ = [
     # 具体工具类
     'KnowledgeSearchTool',
     'WebSearchTool',
+    'WikipediaSearchTool',
+    'SemanticScholarSearchTool',
+    'ArxivSearchTool',
+    'AcademicPaperSearchTool',
     'DataAnalysisTool',
     'CommunicationTool',
+    
+    # 具象化层工具智能体
+    'CodeWriterTool',
+    'CodeLanguage',
+    'CodeType',
+    'CodeGenerationResult',
+    'ThreeDPrintTool',
+    'PrintMaterial',
+    'DesignType',
+    'PrintTechnology',
+    'ThreeDDesignResult',
     
     # 版本管理
     'ToolVersion',

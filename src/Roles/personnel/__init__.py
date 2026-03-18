@@ -40,6 +40,7 @@ from .risk_manager import RiskManager
 from .skeptic import Skeptic
 from .domain_expert import DomainExpert
 from .scholar import Scholar
+from .ideation_agent import IdeationAgent
 
 __all__ = [
     # 基础类
@@ -74,4 +75,5 @@ __all__ = [
     'Skeptic',
     'DomainExpert',
     'Scholar',
+    'IdeationAgent',
 ]

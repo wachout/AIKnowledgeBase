@@ -6,10 +6,7 @@
 
 import os
 from typing import Optional
-from openai import OpenAI
-from langchain_openai import OpenAIEmbeddings
 from dotenv import load_dotenv
-
 
 # 加载.env文件
 load_dotenv()
@@ -137,6 +134,7 @@ class EmbeddingConfig:
             OpenAI客户端实例
         """
         try:
+            from openai import OpenAI
             
             return OpenAI(
                 api_key=self.api_key,
@@ -153,6 +151,7 @@ class EmbeddingConfig:
             OpenAIEmbeddings实例
         """
         try:
+            from langchain_openai import OpenAIEmbeddings
             
             return OpenAIEmbeddings(
                 model=self.model_name,

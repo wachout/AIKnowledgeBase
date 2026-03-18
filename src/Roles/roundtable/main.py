@@ -9,13 +9,12 @@ import logging
 import os
 import re
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Generator, TYPE_CHECKING
 
 # 导入本包内模块
 from .communication import MessageBus, CommunicationProtocol
-from .dialogue import FreeDiscussionCoordinator
-from .interaction_mode import InteractionModeManager
 from .state_management import StateManager
 from .exception_context import AgentExceptionContext
 from .discussion_round import DiscussionRound
@@ -25,7 +24,7 @@ from ..tools.topic_profiler import TopicProfiler, TaskAnalysis
 from ..tools.consensus_tracker import ConsensusTracker
 from ..tools.tool_manager import ToolManager
 from ..tools.knowledge_search_tool import KnowledgeSearchTool
-from ..tools.web_search_tool import WebSearchTool
+from ..tools.web_search_tool import WebSearchTool, WikipediaSearchTool, AcademicPaperSearchTool
 from ..tools.data_analysis_tool import DataAnalysisTool
 from ..tools.communication_tool import CommunicationTool
 
@@ -41,6 +40,7 @@ from ..tools.tool_evaluator import SearchResultEvaluator
 # 导入智能体
 from ..personnel.base_agent import BaseAgent
 from ..personnel.scholar import Scholar
+from ..personnel.ideation_agent import IdeationAgent
 # AgentScope 桥接（可选）：统一三层智能体消息与执行，需安装 agentscope 并设置 USE_AGENTSCOPE=1
 try:
     from .agentscope_bridge import (
@@ -56,7 +56,6 @@ except ImportError:
     run_agent_reply_sync = lambda a, t, c, p: ({}, {})
 from ..personnel.moderator import Moderator
 from ..personnel.facilitator import Facilitator
-from ..personnel.synthesizer import Synthesizer
 from ..personnel.domain_expert import DomainExpert
 from ..personnel.skeptic import Skeptic
 from ..personnel.data_analyst import DataAnalyst
@@ -89,12 +88,6 @@ class RoundtableDiscussion:
         # 初始化通信系统
         self.message_bus = MessageBus()
         self.communication_protocol = CommunicationProtocol(self.message_bus)
-        
-        # 初始化自由讨论协调器和交互模式管理器
-        self.free_discussion_coordinator = FreeDiscussionCoordinator(
-            self.message_bus, self.communication_protocol
-        )
-        self.interaction_mode_manager = InteractionModeManager(self)
 
         # 智能体实例
         self.agents: Dict[str, BaseAgent] = {}
@@ -106,6 +99,10 @@ class RoundtableDiscussion:
         self.discussion_status = "idle"  # idle, analyzing, active, paused, completed
         self.participants = []
         self.discussion_history = []
+
+        # 自主构思产出的论文（供第一层质疑者阅读 discussion/discussion_id/files 并引用）
+        self._ideation_papers: List[Dict[str, Any]] = []
+        self._papers_downloaded_to: str = ""
 
         # 异常上下文记录器
         self.exception_context = AgentExceptionContext()
@@ -136,8 +133,11 @@ class RoundtableDiscussion:
         # 注册基础工具
         self.tool_manager.register_tool(KnowledgeSearchTool())
         self.tool_manager.register_tool(WebSearchTool())
+        self.tool_manager.register_tool(WikipediaSearchTool())
         self.tool_manager.register_tool(DataAnalysisTool())
         self.tool_manager.register_tool(CommunicationTool())
+        # 学术论文检索（Semantic Scholar + arXiv），供自主构思智能体使用
+        self.tool_manager.register_tool(AcademicPaperSearchTool())
         
         # 初始化技能注册中心（单例模式，内置技能已自动注册）
         self.skill_registry = SkillRegistry()
@@ -225,7 +225,13 @@ class RoundtableDiscussion:
         skill_set = AgentSkillSet(agent_name=agent_name)
         
         # 根据角色类型启用不同的技能
-        if role_type in ["scholar", "expert", "domain_expert"]:
+        if role_type == "ideation":
+            # 自主构思：检索论文、文献理解
+            skill_set.add_skill("knowledge_query")
+            skill_set.add_skill("web_research")
+            skill_set.add_skill("fact_check")
+            skill_set.add_skill("collaborative_communication")
+        elif role_type in ["scholar", "expert", "domain_expert"]:
             # 学者和专家启用研究类技能
             skill_set.add_skill("knowledge_query")
             skill_set.add_skill("web_research")
@@ -828,16 +834,57 @@ class RoundtableDiscussion:
                         yield {"step": "discussion_ready", "message": "🎯 圆桌讨论已恢复，可继续讨论", "status": "success", "participants": list(loaded.keys()), "progress": "准备就绪"}
                         return
 
-            # 步骤1: 学者智能体分析任务
+            # 步骤1: 自主构思智能体（检索论文至 discussion/discussion_id/files，产生产生想法与论文依据，协助学者）
             yield {
                 "step": "init_start",
                 "message": "🎭 正在初始化圆桌讨论系统...",
                 "progress": "开始"
             }
 
+            ideation_events = []
+            def _ideation_progress(step_name: str, message: str, data: dict):
+                ideation_events.append({"step": step_name, "message": message, "data": data or {}})
+            ideation_result = {}
+            try:
+                ideation_agent = IdeationAgent(llm_instance=self.llm_instance)
+                self.agents["ideation"] = ideation_agent
+                if hasattr(ideation_agent, 'set_communication_system'):
+                    ideation_agent.set_communication_system(self.message_bus, self.communication_protocol)
+                self._setup_agent_tools_and_skills(ideation_agent, "ideation")
+                # 论文 PDF 保存到 discussion/discussion_id/files（与 state_manager 一致）
+                papers_save_path = str(self.state_manager.storage_path / "files")
+                ideation_result = ideation_agent.run_ideation(
+                    user_task,
+                    task_id=self.discussion_id,
+                    yield_progress=_ideation_progress,
+                    save_path=papers_save_path,
+                )
+                for ev in ideation_events:
+                    yield {
+                        "step": "ideation_agent",
+                        "ideation_step": ev["step"],
+                        "message": ev["message"],
+                        "progress": ev["message"],
+                        **(ev.get("data") or {}),
+                    }
+                yield {
+                    "step": "ideation_agent_complete",
+                    "message": "✅ 自主构思完成：已检索论文并生成有文献支撑的想法，供学者进行任务分析与角色确定",
+                    "ideation_result": ideation_result,
+                    "progress": "自主构思完成"
+                }
+            except Exception as e:
+                logger.warning(f"自主构思智能体执行异常: {e}", exc_info=True)
+                yield {
+                    "step": "ideation_agent_skip",
+                    "message": "⚠️ 自主构思跳过，学者将仅基于任务描述进行分析",
+                    "progress": "自主构思跳过"
+                }
+
+            # 步骤2: 学者智能体（任务分析与角色确定），使用自主构思的想法与论文依据
             yield {
                 "step": "scholar_analysis",
-                "message": "📚 学者智能体正在分析您的任务...",
+                "message": "📚 学者智能体正在分析您的任务（含自主构思的想法与论文依据）...",
                 "progress": "任务分析中"
             }
 
@@ -847,11 +894,23 @@ class RoundtableDiscussion:
                 scholar.set_communication_system(self.message_bus, self.communication_protocol)
             self._setup_agent_tools_and_skills(scholar, "scholar")
 
-            task_analysis = scholar.analyze_task(user_task)
+            task_analysis = scholar.analyze_task(user_task, context={"ideation": ideation_result})
             print(f"📚 学者分析完成: {task_analysis}")
 
             # 将学者分析结果转换为 TaskAnalysis 对象
             task_analysis_obj = self._convert_scholar_result_to_task_analysis(task_analysis, user_task)
+            # 将自主构思结果写入任务分析，供后续话题画像与讨论使用
+            if ideation_result.get("ideas"):
+                setattr(task_analysis_obj, "ideation_ideas", [
+                    {"content": idea.get("content", ""), "supporting_paper_ids": idea.get("supporting_paper_ids", [])}
+                    for idea in ideation_result["ideas"]
+                ])
+            if ideation_result.get("supporting_papers"):
+                setattr(task_analysis_obj, "ideation_papers", ideation_result["supporting_papers"])
+                self._ideation_papers = ideation_result["supporting_papers"]
+            if ideation_result.get("downloaded_to"):
+                setattr(task_analysis_obj, "papers_downloaded_to", ideation_result["downloaded_to"])
+                self._papers_downloaded_to = ideation_result["downloaded_to"]
 
             # 返回学者分析结果
             yield {
@@ -928,20 +987,18 @@ class RoundtableDiscussion:
                     "progress": "智能体创建部分完成"
                 }
 
-            # 确保至少创建了基础智能体
+            # 确保至少创建了基础智能体（已取消综合者/梳理逻辑智能体）
             if len(self.agents) == 0:
                 logger.warning("没有创建任何智能体，创建基础智能体")
-                # 创建基础智能体
+                # 创建基础智能体（主持人 + 协调者）
                 try:
                     moderator = Moderator(llm_instance=self.llm_instance)
                     self.agents["moderator"] = moderator
                     facilitator = Facilitator(llm_instance=self.llm_instance)
                     self.agents["facilitator"] = facilitator
-                    synthesizer = Synthesizer(llm_instance=self.llm_instance)
-                    self.agents["synthesizer"] = synthesizer
 
                     # 设置通信系统和工具/技能
-                    for agent_name, agent in [("moderator", moderator), ("facilitator", facilitator), ("synthesizer", synthesizer)]:
+                    for agent_name, agent in [("moderator", moderator), ("facilitator", facilitator)]:
                         if hasattr(agent, 'set_communication_system'):
                             agent.set_communication_system(self.message_bus, self.communication_protocol)
                         self._setup_agent_tools_and_skills(agent, agent_name)
@@ -949,7 +1006,7 @@ class RoundtableDiscussion:
                     logger.error(f"创建基础智能体失败: {str(e)}", exc_info=True)
                     raise
             else:
-                # 确保至少有 facilitator 和 synthesizer
+                # 确保至少有 facilitator
                 if "facilitator" not in self.agents:
                     try:
                         facilitator = Facilitator(llm_instance=self.llm_instance)
@@ -960,17 +1017,6 @@ class RoundtableDiscussion:
                         logger.info("补充创建 facilitator 智能体")
                     except Exception as e:
                         logger.error(f"创建 facilitator 失败: {str(e)}")
-                
-                if "synthesizer" not in self.agents:
-                    try:
-                        synthesizer = Synthesizer(llm_instance=self.llm_instance)
-                        self.agents["synthesizer"] = synthesizer
-                        if hasattr(synthesizer, 'set_communication_system'):
-                            synthesizer.set_communication_system(self.message_bus, self.communication_protocol)
-                        self._setup_agent_tools_and_skills(synthesizer, "synthesizer")
-                        logger.info("补充创建 synthesizer 智能体")
-                    except Exception as e:
-                        logger.error(f"创建 synthesizer 失败: {str(e)}")
 
             yield {
                 "step": "agent_creation_complete",
@@ -1084,20 +1130,7 @@ class RoundtableDiscussion:
         yield {"step": "round_start", "round": round_number, "message": f"开始第{round_number}轮讨论"}
 
         try:
-            # 步骤6: 协调者安排发言顺序
-            facilitator = self.agents.get("facilitator")
-            if facilitator:
-                coordination = facilitator.coordinate_round(
-                    discussion_context={"topic": self.discussion_topic, "round": round_number},
-                    previous_speeches=self._get_recent_speeches(5),
-                    consensus_points=self._get_consensus_points(),
-                    divergence_points=self._get_divergence_points()
-                )
-
-                current_round.coordination_notes.append(coordination)
-                yield {"step": "coordination", "content": coordination}
-
-            # 确定发言顺序（可以根据协调结果调整）
+            # 确定发言顺序（无协调者，直接按智能体顺序）
             speaking_order = self._determine_speaking_order()
             # 排除本轮已发言的智能体（重启时从状态恢复，不重复发言）
             speaking_order = [name for name in speaking_order if name not in already_spoken_speakers]
@@ -1118,426 +1151,227 @@ class RoundtableDiscussion:
                     speaking_order = list(self.agents.keys())
                     yield {"step": "warning", "message": f"⚠️ 第{round_number}轮讨论：没有找到可发言的智能体，使用所有智能体\n\n**当前智能体列表**: {', '.join(all_agent_names)}"}
 
-            # 每个角色发言
+            # 分组：固定角色、领域专家、质疑者
+            fixed_speakers = []  # 主持人、协调者、数据分析师、风险管理者
+            experts = []         # 领域专家列表
+            skeptics = []        # 质疑者列表
+            expert_skeptic_map = {}  # 专家 -> 质疑者 映射
+            
             for speaker_name in speaking_order:
-                logger.info(f"开始处理智能体发言: {speaker_name}")
-                speaker = self.agents.get(speaker_name)
-                if not speaker:
-                    logger.warning(f"智能体 {speaker_name} 不存在，跳过")
-                    continue
-
-                try:
-                    logger.info(f"为智能体 {speaker_name} 生成 speech_start 步骤")
-                    yield {"step": "speech_start", "speaker": speaker_name}
-
-                    # 智能体思考和发言（带重试机制）
-                    context = self._get_discussion_context()
-                    topic = context.get("topic", self.discussion_topic)
-                    previous_speeches = self._get_recent_speeches(10)
-                    
-                    # ⭐ 新增：获取针对当前专家的质疑（用于多轮讨论时回应质疑）
-                    my_challenges = self._get_unanswered_challenges(speaker_name, round_number)
-                    if my_challenges:
-                        context['my_challenges'] = my_challenges
-                        context['has_pending_challenges'] = True
-                        logger.info(f"📝 {speaker_name} 有 {len(my_challenges)} 条待回应的质疑")
-                    else:
-                        context['my_challenges'] = []
-                        context['has_pending_challenges'] = False
-
-                    logger.info(f"智能体 {speaker_name} 开始思考和发言，主题: {topic}")
-
-                    # 实现发言重试机制（带详细异常上下文记录）
-                    speech_result = None
-                    thinking_result = None
-                    max_speech_retries = 2  # 最多重试2次
-                    thinking_success = False
-                    speech_success = False
-
-                    # 构建上下文信息，用于异常记录
-                    exception_context_info = {
-                        "discussion_topic": topic,
-                        "round_number": round_number,
-                        "speaker_order": list(speaking_order),
-                        "speaker_position": speaking_order.index(speaker_name),
-                        "previous_speeches_count": len(previous_speeches),
-                        "agent_role": speaker.role_definition,
-                        "agent_skills": speaker.professional_skills,
-                        "agent_working_style": speaker.working_style.value
-                    }
-
-                    for speech_attempt in range(max_speech_retries + 1):  # 包括初始尝试
-                        current_attempt = speech_attempt + 1
-
-                        # 可选：使用 AgentScope 统一执行该智能体的 think+speak（第一层）
-                        if current_attempt == 1 and get_agentscope_enabled() and is_agentscope_available():
-                            if not hasattr(self, '_agentscope_adapters') or self._agentscope_adapters is None:
-                                self._agentscope_adapters = create_roundtable_agents_agentscope(self.agents, use_memory=True)
-                            if speaker_name in getattr(self, '_agentscope_adapters', {}):
-                                tr, sr = run_agent_reply_sync(
-                                    self._agentscope_adapters[speaker_name], topic, context, previous_speeches
-                                )
-                                if tr is not None and sr is not None and (sr.get("content") or "").strip():
-                                    thinking_result, speech_result = tr, sr
-                                    thinking_success, speech_success = True, True
-                                    logger.info(f"✅ 智能体 {speaker_name} 通过 AgentScope 完成思考与发言")
-                                    break
-
-                        # === 思考阶段 ===
-                        if not thinking_success:
-                            try:
-                                logger.info(f"智能体 {speaker_name} 第{current_attempt}次尝试 - 思考阶段")
-                                thinking_result = speaker.think(topic, context)
-                                thinking_success = True
-                                logger.info(f"✅ 智能体 {speaker_name} 思考成功")
-
-                            except Exception as e:
-                                error_msg = str(e)
-                                exception_type = self._classify_exception(e)
-                                import traceback
-                                stack_trace = traceback.format_exc()
-
-                                # 记录思考阶段异常
-                                requires_intervention = self._requires_human_intervention(exception_type, "thinking", current_attempt)
-                                intervention_suggestions = self._get_intervention_suggestions(exception_type, "thinking", speaker_name)
-
-                                # 获取 LLM 请求信息（如果可用）
-                                llm_request_info = {
-                                    "prompt_topic": topic,
-                                    "context_keys": list(context.keys()) if context else [],
-                                    "agent_type": type(speaker).__name__
-                                }
-
-                                self.exception_context.record_exception(
-                                    discussion_id=self.discussion_id,
-                                    round_number=round_number,
-                                    speaker_name=speaker_name,
-                                    exception_type=exception_type,
-                                    error_message=error_msg,
-                                    stage="thinking",
-                                    attempt_count=current_attempt,
-                                    context_info=exception_context_info,
-                                    requires_human_intervention=requires_intervention,
-                                    intervention_suggestions=intervention_suggestions,
-                                    llm_request_info=llm_request_info,
-                                    stack_trace=stack_trace,
-                                    recovery_action="retry" if current_attempt <= max_speech_retries else "fallback"
-                                )
-
-                                if current_attempt <= max_speech_retries:
-                                    retry_delay = current_attempt * 2
-                                    logger.info(f"⏳ 思考失败，等待 {retry_delay} 秒后重试...")
-                                    # 发送重试通知给用户
-                                    yield {
-                                        "step": "retry_notification",
-                                        "speaker": speaker_name,
-                                        "stage": "thinking",
-                                        "attempt": current_attempt,
-                                        "max_attempts": max_speech_retries + 1,
-                                        "error_type": exception_type,
-                                        "error_message": error_msg,
-                                        "retry_delay": retry_delay,
-                                        "message": f"⚠️ {speaker_name} 思考失败 ({exception_type})\n第 {current_attempt}/{max_speech_retries + 1} 次尝试\n{retry_delay} 秒后重试..."
-                                    }
-                                    import time
-                                    time.sleep(retry_delay)
-                                    continue
-                                else:
-                                    # 思考失败，创建后备思考结果
-                                    thinking_result = {
-                                        "raw_response": f"{speaker_name}的思考过程因多次失败而被简化。",
-                                        "error": error_msg,
-                                        "error_type": exception_type,
-                                        "is_fallback": True,
-                                        "stack_trace": stack_trace
-                                    }
-                                    logger.error(f"❌ 智能体 {speaker_name} 思考失败，已达到最大重试次数")
-                                    # 发送失败通知
-                                    yield {
-                                        "step": "stage_failed",
-                                        "speaker": speaker_name,
-                                        "stage": "thinking",
-                                        "error_type": exception_type,
-                                        "error_message": error_msg,
-                                        "requires_intervention": requires_intervention,
-                                        "intervention_suggestions": intervention_suggestions,
-                                        "message": f"❌ {speaker_name} 思考阶段失败\n错误类型: {exception_type}\n是否需要人工干预: {'是' if requires_intervention else '否'}"
-                                    }
-
-                        # === 发言阶段 ===
-                        if thinking_success:
-                            try:
-                                logger.info(f"智能体 {speaker_name} 第{current_attempt}次尝试 - 发言阶段")
-                                speech_result = speaker.speak(context, previous_speeches)
-
-                                # 检查发言结果是否有效
-                                if speech_result and speech_result.get('content') and speech_result.get('content').strip():
-                                    speech_success = True
-                                    logger.info(f"✅ 智能体 {speaker_name} 发言成功")
-                                    break  # 发言成功，跳出重试循环
-                                else:
-                                    # 发言内容为空，当作异常处理
-                                    raise ValueError("发言内容为空")
-
-                            except Exception as e:
-                                error_msg = str(e)
-                                exception_type = self._classify_exception(e)
-                                import traceback
-                                stack_trace = traceback.format_exc()
-
-                                # 记录发言阶段异常
-                                requires_intervention = self._requires_human_intervention(exception_type, "speaking", current_attempt)
-                                intervention_suggestions = self._get_intervention_suggestions(exception_type, "speaking", speaker_name)
-
-                                # 获取 LLM 请求信息
-                                llm_request_info = {
-                                    "prompt_topic": topic,
-                                    "context_keys": list(context.keys()) if context else [],
-                                    "previous_speeches_count": len(previous_speeches),
-                                    "agent_type": type(speaker).__name__
-                                }
-
-                                self.exception_context.record_exception(
-                                    discussion_id=self.discussion_id,
-                                    round_number=round_number,
-                                    speaker_name=speaker_name,
-                                    exception_type=exception_type,
-                                    error_message=error_msg,
-                                    stage="speaking",
-                                    attempt_count=current_attempt,
-                                    context_info=exception_context_info,
-                                    requires_human_intervention=requires_intervention,
-                                    intervention_suggestions=intervention_suggestions,
-                                    llm_request_info=llm_request_info,
-                                    stack_trace=stack_trace,
-                                    recovery_action="retry" if current_attempt <= max_speech_retries else "fallback"
-                                )
-
-                                if current_attempt <= max_speech_retries:
-                                    retry_delay = current_attempt * 2
-                                    logger.info(f"⏳ 发言失败，等待 {retry_delay} 秒后重试...")
-                                    # 发送重试通知给用户
-                                    yield {
-                                        "step": "retry_notification",
-                                        "speaker": speaker_name,
-                                        "stage": "speaking",
-                                        "attempt": current_attempt,
-                                        "max_attempts": max_speech_retries + 1,
-                                        "error_type": exception_type,
-                                        "error_message": error_msg,
-                                        "retry_delay": retry_delay,
-                                        "message": f"⚠️ {speaker_name} 发言失败 ({exception_type})\n第 {current_attempt}/{max_speech_retries + 1} 次尝试\n{retry_delay} 秒后重试..."
-                                    }
-                                    import time
-                                    time.sleep(retry_delay)
-                                    continue
-                                else:
-                                    # 发言失败，创建后备发言内容
-                                    speech_result = {
-                                        "agent_name": speaker_name,
-                                        "role": speaker.role_definition,
-                                        "content": f"{speaker_name}经过多次尝试后仍无法正常发言，建议讨论继续进行，其他专家可以补充相关观点。",
-                                        "timestamp": speaker._get_timestamp(),
-                                        "working_style": speaker.working_style.value,
-                                        "professional_skills": speaker.professional_skills,
-                                        "is_fallback": True,
-                                        "error": error_msg,
-                                        "error_type": exception_type,
-                                        "retry_count": current_attempt,
-                                        "stack_trace": stack_trace
-                                    }
-                                    logger.error(f"❌ 智能体 {speaker_name} 发言失败，已达到最大重试次数")
-                                    
-                                    # 记录失败发言，以便后续手动重试
-                                    last_exception = self.exception_context.exception_history[-1] if self.exception_context.exception_history else {}
-                                    exception_id = last_exception.get("exception_id", "unknown")
-                                    failed_speech_id = self.exception_context.record_failed_speech(
-                                        discussion_id=self.discussion_id,
-                                        round_number=round_number,
-                                        speaker_name=speaker_name,
-                                        stage="speaking",
-                                        context=context,
-                                        topic=topic,
-                                        previous_speeches=previous_speeches,
-                                        exception_id=exception_id
-                                    )
-                                    self.exception_context.add_to_retry_queue(failed_speech_id)
-                                    
-                                    # 发送失败通知
-                                    yield {
-                                        "step": "stage_failed",
-                                        "speaker": speaker_name,
-                                        "stage": "speaking",
-                                        "error_type": exception_type,
-                                        "error_message": error_msg,
-                                        "requires_intervention": requires_intervention,
-                                        "intervention_suggestions": intervention_suggestions,
-                                        "failed_speech_id": failed_speech_id,
-                                        "can_retry_later": True,
-                                        "message": f"❌ {speaker_name} 发言阶段失败\n错误类型: {exception_type}\n是否需要人工干预: {'是' if requires_intervention else '否'}\n已加入重试队列: {failed_speech_id}"
-                                    }
-
-                    # 如果整个过程都失败了，确保有基本的后备结果
-                    if not thinking_success and not speech_success:
-                        thinking_result = thinking_result or {
-                            "raw_response": f"{speaker_name}的思考和发言过程完全失败。",
-                            "error": "Complete failure",
-                            "is_fallback": True
-                        }
-                        speech_result = speech_result or {
-                            "agent_name": speaker_name,
-                            "role": speaker.role_definition,
-                            "content": f"{speaker_name}由于系统错误无法参与本次讨论，建议跳过此智能体继续讨论。",
-                            "timestamp": speaker._get_timestamp(),
-                            "working_style": speaker.working_style.value,
-                            "professional_skills": speaker.professional_skills,
-                            "is_fallback": True,
-                            "error": "Complete failure",
-                            "retry_count": max_speech_retries + 1
-                        }
-                    
-                    # 提取发言内容（speech_result 是字典）
-                    speech_content = speech_result.get('content', '') if isinstance(speech_result, dict) else str(speech_result)
-                    thinking_content = thinking_result.get('raw_response', '') if isinstance(thinking_result, dict) else str(thinking_result)
-                    
-                    # 如果发言内容为空，使用默认内容
-                    if not speech_content or speech_content.strip() == '':
-                        speech_content = f"{speaker_name} 就讨论主题发表了观点，但内容为空。"
-                        logger.warning(f"智能体 {speaker_name} 的发言内容为空")
-                    
-                    # 保存发言到轮次记录
-                    current_round.add_speech(speaker_name, speech_content, "expert_opinion")
-
-                    yield {
-                        "step": "speech",
-                        "speaker": speaker_name,
-                        "thinking": thinking_content,
-                        "speech": speech_content
-                    }
-
-                    # 每个专家发言后：对应质疑者发言 → 专家根据质疑修订发言 → 循环两次
-                    if "skeptic" in speaker_name.lower():
-                        pass
-                    elif hasattr(speaker, "revise_speech_after_skeptic"):
-                        # 支持「质疑→专家修订」循环两次
-                        context = self._get_discussion_context()
-                        revision_cycles = 2
-                        try:
-                            for cycle in range(1, revision_cycles + 1):
-                                # 质疑者针对当前版本发言提出质疑
-                                skeptic_response = self._generate_skeptic_response(
-                                    speaker_name, speech_content, current_round
-                                )
-                                if not skeptic_response:
-                                    break
-                                skeptic_name = skeptic_response.get("skeptic_name", f"skeptic_{speaker_name}")
-                                question_content = skeptic_response.get("question_content", "").strip()
-                                thinking_content = skeptic_response.get("thinking", "")
-                                if not question_content:
-                                    break
-                                # yield 质疑者发言
-                                yield {"step": "speech_start", "speaker": skeptic_name}
-                                yield {
-                                    "step": "speech",
-                                    "speaker": skeptic_name,
-                                    "thinking": thinking_content,
-                                    "speech": question_content,
-                                    "target_expert": speaker_name,
-                                }
-                                yield {"step": "speech_end", "speaker": skeptic_name}
-                                # 专家根据质疑修订发言
-                                revised_result = speaker.revise_speech_after_skeptic(
-                                    speech_content,
-                                    question_content,
-                                    context,
-                                    revision_round=cycle,
-                                )
-                                revised_content = (
-                                    revised_result.get("content", "") if isinstance(revised_result, dict) else str(revised_result)
-                                )
-                                if not revised_content or not revised_content.strip():
-                                    revised_content = speech_content
-                                else:
-                                    speech_content = revised_content
-                                    current_round.add_speech(
-                                        speaker_name,
-                                        revised_content,
-                                        "expert_revision",
-                                    )
-                                yield {"step": "speech_start", "speaker": speaker_name}
-                                yield {
-                                    "step": "speech",
-                                    "speaker": speaker_name,
-                                    "thinking": "",
-                                    "speech": revised_content,
-                                    "is_revision": True,
-                                    "revision_round": cycle,
-                                }
-                                yield {"step": "speech_end", "speaker": speaker_name}
-                        except Exception as e:
-                            logger.error(f"质疑→修订循环失败 ({speaker_name}): {str(e)}", exc_info=True)
-                    else:
-                        # 无修订能力的角色：仅一次质疑
-                        try:
-                            skeptic_response = self._generate_skeptic_response(
-                                speaker_name, speech_content, current_round
+                if speaker_name.startswith("expert_") and not speaker_name.startswith("skeptic_"):
+                    experts.append(speaker_name)
+                    # 找到对应的质疑者
+                    skeptic_name = f"skeptic_{speaker_name}"
+                    if skeptic_name in self.agents:
+                        skeptics.append(skeptic_name)
+                        expert_skeptic_map[speaker_name] = skeptic_name
+                elif speaker_name.startswith("skeptic_"):
+                    # 单独的质疑者（没有对应专家的）
+                    if speaker_name not in skeptics:
+                        skeptics.append(speaker_name)
+                else:
+                    # 固定角色
+                    fixed_speakers.append(speaker_name)
+            
+            # 准备并行执行的参数
+            context = self._get_discussion_context()
+            topic = context.get("topic", self.discussion_topic)
+            previous_speeches = self._get_recent_speeches(10)
+            
+            # ========== 阶段0: 固定角色并行发言 ==========
+            if fixed_speakers:
+                yield {"step": "phase_0_start", "message": f"📢 阶段0: 固定角色并行发言（{len(fixed_speakers)}位）..."}
+                
+                fixed_results = []
+                with ThreadPoolExecutor(max_workers=min(len(fixed_speakers), 30)) as executor:
+                    futures = {}
+                    for speaker_name in fixed_speakers:
+                        speaker = self.agents.get(speaker_name)
+                        if speaker:
+                            speaker_context = context.copy()
+                            future = executor.submit(
+                                self._execute_single_agent_speech,
+                                speaker_name, speaker, topic, speaker_context, previous_speeches, round_number
                             )
-                            if skeptic_response:
-                                skeptic_name = skeptic_response.get("skeptic_name", f"skeptic_{speaker_name}")
-                                question_content = skeptic_response.get("question_content", "")
-                                thinking_content = skeptic_response.get("thinking", "")
-                                if question_content and question_content.strip():
-                                    yield {"step": "speech_start", "speaker": skeptic_name}
-                                    yield {
-                                        "step": "speech",
-                                        "speaker": skeptic_name,
-                                        "thinking": thinking_content,
-                                        "speech": question_content,
-                                        "target_expert": speaker_name,
-                                    }
-                                    yield {"step": "speech_end", "speaker": skeptic_name}
-                        except Exception as e:
-                            logger.error(f"生成质疑者响应失败 ({speaker_name}): {str(e)}", exc_info=True)
-
-                    yield {"step": "speech_end", "speaker": speaker_name}
+                            futures[future] = speaker_name
                     
-                except Exception as e:
-                    logger.error(f"智能体 {speaker_name} 发言失败: {str(e)}", exc_info=True)
-                    yield {
-                        "step": "speech_error",
-                        "speaker": speaker_name,
-                        "error": str(e),
-                        "message": f"⚠️ {speaker_name} 发言时出错: {str(e)}"
-                    }
-                    # 继续下一个智能体，不中断整个流程
-                    continue
+                    for future in as_completed(futures):
+                        speaker_name = futures[future]
+                        try:
+                            result = future.result()
+                            fixed_results.append(result)
+                            logger.info(f"固定角色 {speaker_name} 发言完成")
+                        except Exception as e:
+                            logger.error(f"固定角色 {speaker_name} 发言失败: {e}")
+                            fixed_results.append({
+                                "speaker_name": speaker_name,
+                                "speech_result": {"content": f"{speaker_name}发言失败: {e}", "is_fallback": True},
+                                "speech_success": False, "error": str(e)
+                            })
+                
+                # 输出固定角色发言结果
+                for result in fixed_results:
+                    yield from self._process_speech_result(result["speaker_name"], result, current_round)
+                
+                yield {"step": "phase_0_done", "message": f"✅ 阶段0完成: {len(fixed_results)}位固定角色发言完毕"}
+            
+            # ========== 阶段1: 所有领域专家并行发言 ==========
+            expert_speeches = {}  # 保存专家发言内容，供质疑者和反馈阶段使用
+            
+            if experts:
+                yield {"step": "phase_1_start", "message": f"🎓 阶段1: 领域专家并行发言（{len(experts)}位）..."}
+                
+                expert_results = []
+                with ThreadPoolExecutor(max_workers=min(len(experts), 30)) as executor:
+                    futures = {}
+                    for expert_name in experts:
+                        expert = self.agents.get(expert_name)
+                        if expert:
+                            expert_context = context.copy()
+                            my_challenges = self._get_unanswered_challenges(expert_name, round_number)
+                            expert_context['my_challenges'] = my_challenges
+                            expert_context['has_pending_challenges'] = bool(my_challenges)
+                            
+                            future = executor.submit(
+                                self._execute_single_agent_speech,
+                                expert_name, expert, topic, expert_context, previous_speeches, round_number
+                            )
+                            futures[future] = expert_name
+                    
+                    for future in as_completed(futures):
+                        expert_name = futures[future]
+                        try:
+                            result = future.result()
+                            expert_results.append(result)
+                            # 保存专家发言内容
+                            expert_speeches[expert_name] = result.get("speech_result", {}).get("content", "")
+                            logger.info(f"专家 {expert_name} 发言完成")
+                        except Exception as e:
+                            logger.error(f"专家 {expert_name} 发言失败: {e}")
+                            expert_results.append({
+                                "speaker_name": expert_name,
+                                "speech_result": {"content": f"{expert_name}发言失败: {e}", "is_fallback": True},
+                                "speech_success": False, "error": str(e)
+                            })
+                            expert_speeches[expert_name] = ""
+                
+                # 输出专家发言结果
+                for result in expert_results:
+                    yield from self._process_speech_result(result["speaker_name"], result, current_round)
+                
+                yield {"step": "phase_1_done", "message": f"✅ 阶段1完成: {len(expert_results)}位专家发言完毕"}
+            
+            # ========== 阶段2: 所有质疑者并行发言（针对专家发言进行质疑） ==========
+            skeptic_speeches = {}  # 保存质疑者发言内容，供专家反馈阶段使用
+            
+            if skeptics:
+                yield {"step": "phase_2_start", "message": f"🔍 阶段2: 质疑者并行发言（{len(skeptics)}位）..."}
+                
+                # 更新 previous_speeches，包含阶段1的专家发言
+                updated_speeches = previous_speeches.copy()
+                for expert_name, speech in expert_speeches.items():
+                    updated_speeches.append({"speaker": expert_name, "content": speech})
+                
+                skeptic_results = []
+                with ThreadPoolExecutor(max_workers=min(len(skeptics), 30)) as executor:
+                    futures = {}
+                    for skeptic_name in skeptics:
+                        skeptic = self.agents.get(skeptic_name)
+                        if skeptic:
+                            skeptic_context = context.copy()
+                            # 找到对应的专家发言
+                            target_expert = skeptic_name.replace("skeptic_", "")
+                            if target_expert in expert_speeches:
+                                skeptic_context['expert_speech'] = expert_speeches[target_expert]
+                                skeptic_context['target_expert'] = target_expert
+                            skeptic_context['all_expert_speeches'] = expert_speeches
+                            
+                            future = executor.submit(
+                                self._execute_single_agent_speech,
+                                skeptic_name, skeptic, topic, skeptic_context, updated_speeches, round_number
+                            )
+                            futures[future] = skeptic_name
+                    
+                    for future in as_completed(futures):
+                        skeptic_name = futures[future]
+                        try:
+                            result = future.result()
+                            skeptic_results.append(result)
+                            # 保存质疑者发言内容
+                            skeptic_speeches[skeptic_name] = result.get("speech_result", {}).get("content", "")
+                            logger.info(f"质疑者 {skeptic_name} 发言完成")
+                        except Exception as e:
+                            logger.error(f"质疑者 {skeptic_name} 发言失败: {e}")
+                            skeptic_results.append({
+                                "speaker_name": skeptic_name,
+                                "speech_result": {"content": f"{skeptic_name}发言失败: {e}", "is_fallback": True},
+                                "speech_success": False, "error": str(e)
+                            })
+                            skeptic_speeches[skeptic_name] = ""
+                
+                # 输出质疑者发言结果
+                for result in skeptic_results:
+                    yield from self._process_speech_result(result["speaker_name"], result, current_round)
+                
+                yield {"step": "phase_2_done", "message": f"✅ 阶段2完成: {len(skeptic_results)}位质疑者发言完毕"}
+            
+            # ========== 阶段3: 专家根据质疑反馈再次并行发言 ==========
+            if experts and skeptics:
+                yield {"step": "phase_3_start", "message": f"💬 阶段3: 专家根据质疑反馈再次并行发言（{len(experts)}位）..."}
+                
+                # 更新 previous_speeches，包含质疑者发言
+                feedback_speeches = updated_speeches.copy()
+                for skeptic_name, speech in skeptic_speeches.items():
+                    feedback_speeches.append({"speaker": skeptic_name, "content": speech})
+                
+                feedback_results = []
+                with ThreadPoolExecutor(max_workers=min(len(experts), 30)) as executor:
+                    futures = {}
+                    for expert_name in experts:
+                        expert = self.agents.get(expert_name)
+                        if expert:
+                            expert_context = context.copy()
+                            expert_context['is_feedback_round'] = True
+                            expert_context['my_previous_speech'] = expert_speeches.get(expert_name, "")
+                            
+                            # 找到对应质疑者的反馈
+                            skeptic_name = expert_skeptic_map.get(expert_name)
+                            if skeptic_name:
+                                expert_context['skeptic_feedback'] = skeptic_speeches.get(skeptic_name, "")
+                                expert_context['skeptic_name'] = skeptic_name
+                            expert_context['all_skeptic_speeches'] = skeptic_speeches
+                            
+                            future = executor.submit(
+                                self._execute_single_agent_speech,
+                                expert_name, expert, topic, expert_context, feedback_speeches, round_number
+                            )
+                            futures[future] = expert_name
+                    
+                    for future in as_completed(futures):
+                        expert_name = futures[future]
+                        try:
+                            result = future.result()
+                            # 标记为反馈发言
+                            result["is_feedback"] = True
+                            feedback_results.append(result)
+                            logger.info(f"专家 {expert_name} 反馈发言完成")
+                        except Exception as e:
+                            logger.error(f"专家 {expert_name} 反馈发言失败: {e}")
+                            feedback_results.append({
+                                "speaker_name": expert_name,
+                                "speech_result": {"content": f"{expert_name}反馈发言失败: {e}", "is_fallback": True},
+                                "speech_success": False, "error": str(e), "is_feedback": True
+                            })
+                
+                # 输出专家反馈发言结果
+                for result in feedback_results:
+                    yield from self._process_speech_result(result["speaker_name"], result, current_round, is_feedback=True)
+                
+                yield {"step": "phase_3_done", "message": f"✅ 阶段3完成: {len(feedback_results)}位专家反馈发言完毕"}
+            
+            yield {"step": "all_phases_done", "message": f"🎉 三阶段发言全部完成（固定角色{len(fixed_speakers)}位 + 专家{len(experts)}位 + 质疑者{len(skeptics)}位）"}
 
-            # 步骤6.5: 深度讨论阶段 - 专家间直接交互
-            yield from self._conduct_depth_discussion_phase(current_round, round_number)
-
-            # 步骤7: 综合者整合观点
-            logger.info("开始综合者整合观点")
-            synthesizer = self.agents.get("synthesizer")
-            if synthesizer:
-                all_speeches = [s for round_obj in self.discussion_rounds for s in round_obj.speeches]
-                logger.info(f"综合者将整合 {len(all_speeches)} 条发言")
-
-                synthesis_result = synthesizer.synthesize_opinions(
-                    opinions=self._extract_opinions_from_speeches(all_speeches),
-                    discussion_context=self._get_discussion_context()
-                )
-                logger.info("综合者整合观点完成")
-            else:
-                synthesis_result = {"content": "综合者不可用"}
-                logger.warning("综合者智能体不存在")
-
-            # 提取综合内容
-            synthesis_content = synthesis_result.get('synthesis_report', '') if isinstance(synthesis_result, dict) else str(synthesis_result)
-            if not synthesis_content and isinstance(synthesis_result, dict):
-                synthesis_content = synthesis_result.get('content', str(synthesis_result))
-
-            current_round.add_speech("synthesizer", synthesis_content, "synthesis")
-            yield {"step": "synthesis", "content": {"synthesis_result": synthesis_content}}
+            # 已取消步骤6.5（深度讨论阶段）与步骤7（梳理逻辑/综合者智能体）：第一层各智能体输出直接通过 rounds 传给第二层对应实施智能体
 
             # 步骤8: 更新共识追踪器
             round_consensus = self._extract_round_consensus(current_round)
@@ -1641,156 +1475,187 @@ class RoundtableDiscussion:
         return final_report
 
     def _create_role_agents_stream(self, task_analysis):
-        """创建角色智能体（流式返回）"""
+        """创建角色智能体（并行创建，流式返回）"""
         llm = self.llm_instance
-
-        # 主持人
-        moderator = Moderator(llm_instance=llm)
-        self.agents["moderator"] = moderator
-        if hasattr(moderator, 'set_communication_system'):
-            moderator.set_communication_system(self.message_bus, self.communication_protocol)
-        self._setup_agent_tools_and_skills(moderator, "moderator")
-        yield {
-            "step": "agent_created",
-            "agent_name": "moderator",
-            "agent_role": "主持人",
-            "message": "🎙️ 创建主持人智能体",
-            "description": "控制议程、引导讨论",
-            "progress": f"创建智能体: 主持人",
-            "agent_config": moderator.to_config_dict() if hasattr(moderator, 'to_config_dict') else None
-        }
-
-        # 协调者
-        facilitator = Facilitator(llm_instance=llm)
-        self.agents["facilitator"] = facilitator
-        if hasattr(facilitator, 'set_communication_system'):
-            facilitator.set_communication_system(self.message_bus, self.communication_protocol)
-        self._setup_agent_tools_and_skills(facilitator, "facilitator")
-        yield {
-            "step": "agent_created",
-            "agent_name": "facilitator",
-            "agent_role": "协调者",
-            "message": "👨‍⚖️ 创建协调者智能体",
-            "description": "促进和谐讨论、沟通协调、冲突解决",
-            "progress": f"创建智能体: 协调者",
-            "agent_config": facilitator.to_config_dict() if hasattr(facilitator, 'to_config_dict') else None
-        }
-
-        # 综合者
-        synthesizer = Synthesizer(llm_instance=llm)
-        self.agents["synthesizer"] = synthesizer
-        if hasattr(synthesizer, 'set_communication_system'):
-            synthesizer.set_communication_system(self.message_bus, self.communication_protocol)
-        self._setup_agent_tools_and_skills(synthesizer, "synthesizer")
-        yield {
-            "step": "agent_created",
-            "agent_name": "synthesizer",
-            "agent_role": "综合者",
-            "message": "🔄 创建综合者智能体",
-            "description": "整合各方观点、系统思维、方案比较",
-            "progress": f"创建智能体: 综合者",
-            "agent_config": synthesizer.to_config_dict() if hasattr(synthesizer, 'to_config_dict') else None
-        }
-
-        # 数据分析师
-        data_analyst = DataAnalyst(llm_instance=llm)
-        self.agents["data_analyst"] = data_analyst
-        if hasattr(data_analyst, 'set_communication_system'):
-            data_analyst.set_communication_system(self.message_bus, self.communication_protocol)
-        self._setup_agent_tools_and_skills(data_analyst, "data_analyst")
-        yield {
-            "step": "agent_created",
-            "agent_name": "data_analyst",
-            "agent_role": "数据分析师",
-            "message": "📊 创建数据分析师智能体",
-            "description": "数据支撑分析、可视化、数据洞察",
-            "progress": f"创建智能体: 数据分析师",
-            "agent_config": data_analyst.to_config_dict() if hasattr(data_analyst, 'to_config_dict') else None
-        }
-
-        # 风险管理者
-        risk_manager = RiskManager(llm_instance=llm)
-        self.agents["risk_manager"] = risk_manager
-        if hasattr(risk_manager, 'set_communication_system'):
-            risk_manager.set_communication_system(self.message_bus, self.communication_protocol)
-        self._setup_agent_tools_and_skills(risk_manager, "risk_manager")
-        yield {
-            "step": "agent_created",
-            "agent_name": "risk_manager",
-            "agent_role": "风险管理者",
-            "message": "⚠️ 创建风险管理者智能体",
-            "description": "风险评估、识别、缓解建议",
-            "progress": f"创建智能体: 风险管理者",
-            "agent_config": risk_manager.to_config_dict() if hasattr(risk_manager, 'to_config_dict') else None
-        }
-
-        # 根据任务分析创建领域专家
+        
+        # 定义单个智能体创建函数
+        def create_single_agent(agent_type: str, role_info: dict = None):
+            """
+            创建单个智能体
+            Args:
+                agent_type: 智能体类型 (moderator/facilitator/data_analyst/risk_manager/expert_with_skeptic)
+                role_info: 领域专家需要的角色信息
+            Returns:
+                单个智能体: (agent_name, agent_instance, yield_info)
+                专家+质疑者: ((expert_name, expert, expert_info), (skeptic_name, skeptic, skeptic_info))
+            """
+            try:
+                if agent_type == "moderator":
+                    agent = Moderator(llm_instance=llm)
+                    return ("moderator", agent, {
+                        "step": "agent_created",
+                        "agent_name": "moderator",
+                        "agent_role": "主持人",
+                        "message": "🎙️ 创建主持人智能体",
+                        "description": "控制议程、引导讨论",
+                        "progress": "创建智能体: 主持人",
+                        "agent_config": agent.to_config_dict() if hasattr(agent, 'to_config_dict') else None
+                    })
+                
+                elif agent_type == "facilitator":
+                    agent = Facilitator(llm_instance=llm)
+                    return ("facilitator", agent, {
+                        "step": "agent_created",
+                        "agent_name": "facilitator",
+                        "agent_role": "协调者",
+                        "message": "🤝 创建协调者智能体",
+                        "description": "协调讨论、促进共识",
+                        "progress": "创建智能体: 协调者",
+                        "agent_config": agent.to_config_dict() if hasattr(agent, 'to_config_dict') else None
+                    })
+                
+                elif agent_type == "data_analyst":
+                    agent = DataAnalyst(llm_instance=llm)
+                    return ("data_analyst", agent, {
+                        "step": "agent_created",
+                        "agent_name": "data_analyst",
+                        "agent_role": "数据分析师",
+                        "message": "📊 创建数据分析师智能体",
+                        "description": "数据支撑分析、可视化、数据洞察",
+                        "progress": "创建智能体: 数据分析师",
+                        "agent_config": agent.to_config_dict() if hasattr(agent, 'to_config_dict') else None
+                    })
+                
+                elif agent_type == "risk_manager":
+                    agent = RiskManager(llm_instance=llm)
+                    return ("risk_manager", agent, {
+                        "step": "agent_created",
+                        "agent_name": "risk_manager",
+                        "agent_role": "风险管理者",
+                        "message": "⚠️ 创建风险管理者智能体",
+                        "description": "风险评估、识别、缓解建议",
+                        "progress": "创建智能体: 风险管理者",
+                        "agent_config": agent.to_config_dict() if hasattr(agent, 'to_config_dict') else None
+                    })
+                
+                elif agent_type == "expert_with_skeptic" and role_info:
+                    # 在同一个线程中创建专家和对应的质疑者
+                    role_name = role_info.get("role", "领域专家")
+                    clean_role_name = role_name.lower().replace(' ', '_').replace('-', '_').replace('（', '').replace('）', '').replace('(', '').replace(')', '')
+                    expert_name = f"expert_{clean_role_name}"
+                    skeptic_name = f"skeptic_{expert_name}"
+                    
+                    priority_map = {"high": "高", "medium": "中", "low": "低", "高": "高", "中": "中", "低": "低"}
+                    priority = role_info.get("priority", "medium")
+                    priority_cn = priority_map.get(priority.lower() if isinstance(priority, str) else "中", "中")
+                    
+                    expert_analysis = {
+                        "domain": role_name,
+                        "expertise_area": role_info.get("reason", role_name),
+                        "priority": priority_cn
+                    }
+                    
+                    # 创建专家
+                    expert = DomainExpert.create_from_analysis(expert_analysis=expert_analysis, llm_instance=llm)
+                    expert_info = {
+                        "step": "agent_created",
+                        "agent_name": expert_name,
+                        "agent_role": f"领域专家 - {role_name}",
+                        "message": f"🎓 创建{role_name}领域专家",
+                        "description": f"提供{role_name}领域的专业观点和深度分析",
+                        "progress": f"创建专家智能体: {role_name}",
+                        "agent_config": expert.to_config_dict() if hasattr(expert, 'to_config_dict') else None
+                    }
+                    
+                    # 创建质疑者
+                    skeptic = Skeptic.create_for_expert(expert=expert, llm_instance=llm)
+                    skeptic_info = {
+                        "step": "agent_created",
+                        "agent_name": skeptic_name,
+                        "agent_role": f"质疑者 - {role_name}",
+                        "message": f"🔍 创建{role_name}质疑者",
+                        "description": f"对{role_name}专家的观点进行质疑和批判性审查",
+                        "progress": f"创建质疑者: {role_name}",
+                        "agent_config": skeptic.to_config_dict() if hasattr(skeptic, 'to_config_dict') else None
+                    }
+                    
+                    # 返回专家+质疑者组合
+                    return ("expert_with_skeptic", (expert_name, expert, expert_info), (skeptic_name, skeptic, skeptic_info))
+                
+                return None
+            except Exception as e:
+                logger.error(f"创建智能体 {agent_type} 失败: {e}")
+                return None
+        
+        # 收集所有创建任务
+        creation_tasks = []
+        
+        # 固定角色智能体（含协调者）
+        fixed_roles = ["moderator", "facilitator", "data_analyst", "risk_manager"]
+        for role in fixed_roles:
+            creation_tasks.append((role, None, 0))  # (type, role_info, order)
+        
+        # 动态领域专家+质疑者（绑定创建）
+        num_roles = len(task_analysis.recommended_roles)
+        logger.info(f"将并行创建 {4 + num_roles * 2} 个智能体（4个固定角色 + {num_roles}组专家+质疑者）")
+        
         for i, role_info in enumerate(task_analysis.recommended_roles):
-            role_name = role_info.get("role", "领域专家")
-            # 清理角色名称，移除空格和特殊字符，用于生成 agent_name
-            clean_role_name = role_name.lower().replace(' ', '_').replace('-', '_').replace('（', '').replace('）', '').replace('(', '').replace(')', '')
-            agent_name = f"expert_{clean_role_name}"
-
-            # 构建专家分析字典
-            # 将优先级从英文转换为中文（如果必要）
-            priority_map = {
-                "high": "高",
-                "medium": "中",
-                "low": "低",
-                "高": "高",
-                "中": "中",
-                "低": "低"
-            }
-            priority = role_info.get("priority", "medium")
-            priority_cn = priority_map.get(priority.lower() if isinstance(priority, str) else "中", "中")
+            creation_tasks.append(("expert_with_skeptic", role_info, 10 + i))
+        
+        # 并行创建所有智能体（专家+质疑者在同一线程中创建）
+        yield {"step": "parallel_agent_creation_start", "message": f"开始并行创建 {4 + num_roles} 组智能体..."}
+        
+        all_results = []
+        with ThreadPoolExecutor(max_workers=min(4 + num_roles, 30)) as executor:
+            futures = {}
+            for task_type, role_info, order in creation_tasks:
+                future = executor.submit(create_single_agent, task_type, role_info)
+                futures[future] = (task_type, order)
             
-            expert_analysis = {
-                "domain": role_name,
-                "expertise_area": role_info.get("reason", role_name),
-                "priority": priority_cn
-            }
-            
-            expert = DomainExpert.create_from_analysis(
-                expert_analysis=expert_analysis,
-                llm_instance=llm
-            )
-            self.agents[agent_name] = expert
-            if hasattr(expert, 'set_communication_system'):
-                expert.set_communication_system(self.message_bus, self.communication_protocol)
-            self._setup_agent_tools_and_skills(expert, "domain_expert")
-            
-            # 为每个专家创建领域专家智能体
-            yield {
-                "step": "agent_created",
-                "agent_name": agent_name,
-                "agent_role": f"领域专家 - {role_name}",
-                "message": f"🎓 创建{role_name}领域专家",
-                "description": f"提供{role_name}领域的专业观点和深度分析",
-                "progress": f"创建专家智能体: {role_name}",
-                "agent_config": expert.to_config_dict() if hasattr(expert, 'to_config_dict') else None
-            }
-
-            # 为每个专家创建质疑者
-            skeptic_name = f"skeptic_{agent_name}"
-
-            # 使用专家对象创建质疑者，而不是字符串
-            skeptic = Skeptic.create_for_expert(expert=expert, llm_instance=llm)
-            self.agents[skeptic_name] = skeptic
-
-            # 为智能体设置通信系统和工具/技能
-            if hasattr(skeptic, 'set_communication_system'):
-                skeptic.set_communication_system(self.message_bus, self.communication_protocol)
-            self._setup_agent_tools_and_skills(skeptic, "skeptic")
-            
-            yield {
-                "step": "agent_created",
-                "agent_name": skeptic_name,
-                "agent_role": f"质疑者 - {role_name}",
-                "message": f"🔍 创建{role_name}质疑者",
-                "description": f"对{role_name}专家的观点进行质疑和批判性审查",
-                "progress": f"创建质疑者: {role_name}",
-                "agent_config": skeptic.to_config_dict() if hasattr(skeptic, 'to_config_dict') else None
-            }
+            for future in as_completed(futures):
+                task_type, order = futures[future]
+                try:
+                    result = future.result()
+                    if result:
+                        all_results.append((order, task_type, result))
+                        if task_type == "expert_with_skeptic":
+                            logger.info(f"专家+质疑者组 {result[1][0]} 并行创建完成")
+                        else:
+                            logger.info(f"智能体 {result[0]} 并行创建完成")
+                except Exception as e:
+                    logger.error(f"创建智能体 {task_type} 失败: {e}")
+        
+        # 按顺序注册智能体并 yield 进度
+        all_results.sort(key=lambda x: x[0])
+        
+        for _, task_type, result in all_results:
+            if task_type == "expert_with_skeptic":
+                # 处理专家+质疑者组合
+                _, (expert_name, expert, expert_info), (skeptic_name, skeptic, skeptic_info) = result
+                
+                # 注册专家
+                self.agents[expert_name] = expert
+                if hasattr(expert, 'set_communication_system'):
+                    expert.set_communication_system(self.message_bus, self.communication_protocol)
+                self._setup_agent_tools_and_skills(expert, "domain_expert")
+                yield expert_info
+                
+                # 注册质疑者
+                self.agents[skeptic_name] = skeptic
+                if hasattr(skeptic, 'set_communication_system'):
+                    skeptic.set_communication_system(self.message_bus, self.communication_protocol)
+                self._setup_agent_tools_and_skills(skeptic, "skeptic")
+                yield skeptic_info
+            else:
+                # 处理固定角色
+                agent_name, agent, yield_info = result
+                self.agents[agent_name] = agent
+                if hasattr(agent, 'set_communication_system'):
+                    agent.set_communication_system(self.message_bus, self.communication_protocol)
+                self._setup_agent_tools_and_skills(agent, agent_name)
+                yield yield_info
+        
+        yield {"step": "parallel_agent_creation_done", "message": f"并行创建完成，共 {len(self.agents)} 个智能体"}
 
     def _create_role_agents(self, task_analysis):
         """创建角色智能体（原有方法，保持兼容性）"""
@@ -1851,7 +1716,6 @@ class RoundtableDiscussion:
             for role, cls in [
                 ("moderator", Moderator),
                 ("facilitator", Facilitator),
-                ("synthesizer", Synthesizer),
                 ("data_analyst", DataAnalyst),
                 ("risk_manager", RiskManager),
             ]:
@@ -1907,7 +1771,7 @@ class RoundtableDiscussion:
 
             task_analysis.set_domain_analysis(primary_domain, secondary_domains, cross_domain_aspects)
 
-            # 设置参与者分析
+            # 设置参与者分析：学者输出的每一个角色都会自动创建对应智能体，不遗漏
             required_experts = analysis_data.get("required_experts", [])
             recommended_roles = []
 
@@ -1919,6 +1783,15 @@ class RoundtableDiscussion:
                         "priority": expert.get("priority", "medium")
                     }
                     recommended_roles.append(role_info)
+
+            # 若解析结果无任何角色，使用默认角色确保至少创建一批智能体
+            if not recommended_roles:
+                logger.warning("学者分析未产出 required_experts，使用默认角色列表以确保创建智能体")
+                recommended_roles = [
+                    {"role": "综合分析", "reason": "任务分析与多领域协调", "priority": "高"},
+                    {"role": "技术实现", "reason": "方案落地与实施", "priority": "中"},
+                    {"role": "风险评估", "reason": "风险识别与应对", "priority": "中"},
+                ]
 
             participant_count = max(len(recommended_roles), 3)  # 最少3个参与者
             collaboration_patterns = analysis_data.get("collaboration_mechanism", {}).get("patterns", ["专家协作", "信息共享"])
@@ -1944,13 +1817,68 @@ class RoundtableDiscussion:
 
         return task_analysis
 
+    def _process_speech_result(self, speaker_name: str, result: dict, current_round: DiscussionRound, is_feedback: bool = False):
+        """
+        处理单个智能体的发言结果并 yield 输出
+        
+        Args:
+            speaker_name: 发言者名称
+            result: 发言结果字典
+            current_round: 当前讨论轮次
+            is_feedback: 是否是专家反馈发言（阶段3）
+            
+        Yields:
+            发言处理过程的各个步骤
+        """
+        try:
+            step_prefix = "feedback_" if is_feedback else ""
+            yield {"step": f"{step_prefix}speech_start", "speaker": speaker_name, "is_feedback": is_feedback}
+            
+            thinking_result = result.get("thinking_result", {})
+            speech_result = result.get("speech_result", {})
+            
+            speech_content = speech_result.get('content', '') if isinstance(speech_result, dict) else str(speech_result)
+            thinking_content = thinking_result.get('raw_response', '') if isinstance(thinking_result, dict) else str(thinking_result)
+            
+            if not speech_content or speech_content.strip() == '':
+                speech_content = f"{speaker_name} 就讨论主题发表了观点，但内容为空。"
+            
+            # 保存发言到轮次记录
+            if is_feedback:
+                speech_type = "expert_feedback"
+            elif speaker_name.startswith("skeptic_"):
+                speech_type = "skeptic_question"
+            else:
+                speech_type = "expert_opinion"
+            current_round.add_speech(speaker_name, speech_content, speech_type)
+            
+            yield {
+                "step": f"{step_prefix}speech",
+                "speaker": speaker_name,
+                "thinking": thinking_content,
+                "speech": speech_content,
+                "is_feedback": is_feedback
+            }
+            
+            yield {"step": f"{step_prefix}speech_end", "speaker": speaker_name, "is_feedback": is_feedback}
+            
+        except Exception as e:
+            logger.error(f"智能体 {speaker_name} 发言处理失败: {str(e)}", exc_info=True)
+            yield {
+                "step": "speech_error",
+                "speaker": speaker_name,
+                "error": str(e),
+                "message": f"⚠️ {speaker_name} 发言时出错: {str(e)}",
+                "is_feedback": is_feedback
+            }
+
     def _determine_speaking_order(self) -> List[str]:
         """确定发言顺序"""
         # 基本发言顺序：专家们先发言，然后是质疑者，最后是数据分析师和风险管理者
         order = []
         
         # 排除不需要发言的角色
-        excluded_roles = {"scholar", "moderator"}  # synthesizer 需要在最后整合观点
+        excluded_roles = {"scholar", "moderator", "ideation"}  # ideation 仅协助学者；已取消 synthesizer，第一层各智能体输出直接按领域传第二层
         
         # 获取所有智能体名称用于调试
         all_agent_names = list(self.agents.keys())
@@ -1974,16 +1902,14 @@ class RoundtableDiscussion:
         order.extend(sorted(skeptics))
         logger.info(f"找到的质疑者: {skeptics}")
 
-        # 其他角色（数据分析师、风险管理者、协调者）
-        other_roles = ["data_analyst", "risk_manager", "facilitator"]
+        # 其他角色（协调者、数据分析师、风险管理者）
+        other_roles = ["facilitator", "data_analyst", "risk_manager"]
         for role in other_roles:
             if role in self.agents and role not in excluded_roles:
                 order.append(role)
         logger.info(f"其他角色: {[r for r in other_roles if r in self.agents]}")
-        
-        # 最后是综合者整合观点
-        if "synthesizer" in self.agents:
-            order.append("synthesizer")
+
+        # 已取消综合者：第一层结果直接按领域传给第二层实施智能体，不再经过梳理逻辑智能体
 
         logger.info(f"最终确定的发言顺序: {order}, 总智能体数: {len(self.agents)}")
         
@@ -2001,8 +1927,132 @@ class RoundtableDiscussion:
         
         return order
 
-    def _generate_skeptic_response(self, target_expert: str, expert_speech: str, current_round: DiscussionRound):
-        """生成质疑者回应（使用标准化通信协议）"""
+    def _execute_single_agent_speech(
+        self,
+        speaker_name: str,
+        speaker,
+        topic: str,
+        context: Dict[str, Any],
+        previous_speeches: List[Dict[str, Any]],
+        round_number: int,
+        max_retries: int = 2
+    ) -> Dict[str, Any]:
+        """
+        执行单个智能体的思考和发言（用于并行执行）
+        
+        Args:
+            speaker_name: 智能体名称
+            speaker: 智能体实例
+            topic: 讨论主题
+            context: 讨论上下文
+            previous_speeches: 之前的发言列表
+            round_number: 轮次编号
+            max_retries: 最大重试次数
+        
+        Returns:
+            包含 thinking_result, speech_result, success 等信息的字典
+        """
+        result = {
+            "speaker_name": speaker_name,
+            "thinking_result": None,
+            "speech_result": None,
+            "thinking_success": False,
+            "speech_success": False,
+            "error": None
+        }
+        
+        # 可选：AgentScope 统一执行
+        if get_agentscope_enabled() and is_agentscope_available():
+            if hasattr(self, '_agentscope_adapters') and self._agentscope_adapters:
+                if speaker_name in self._agentscope_adapters:
+                    tr, sr = run_agent_reply_sync(
+                        self._agentscope_adapters[speaker_name], topic, context, previous_speeches
+                    )
+                    if tr is not None and sr is not None and (sr.get("content") or "").strip():
+                        result["thinking_result"] = tr
+                        result["speech_result"] = sr
+                        result["thinking_success"] = True
+                        result["speech_success"] = True
+                        logger.info(f"✅ 智能体 {speaker_name} 通过 AgentScope 完成思考与发言")
+                        return result
+        
+        # 重试循环
+        for attempt in range(max_retries + 1):
+            current_attempt = attempt + 1
+            
+            # 思考阶段
+            if not result["thinking_success"]:
+                try:
+                    logger.info(f"智能体 {speaker_name} 第{current_attempt}次尝试 - 思考阶段")
+                    result["thinking_result"] = speaker.think(topic, context)
+                    result["thinking_success"] = True
+                    logger.info(f"✅ 智能体 {speaker_name} 思考成功")
+                except Exception as e:
+                    logger.warning(f"智能体 {speaker_name} 思考失败 (尝试 {current_attempt}): {e}")
+                    if current_attempt <= max_retries:
+                        import time
+                        time.sleep(current_attempt * 2)
+                        continue
+                    else:
+                        result["thinking_result"] = {
+                            "raw_response": f"{speaker_name}的思考过程因多次失败而被简化。",
+                            "error": str(e),
+                            "is_fallback": True
+                        }
+            
+            # 发言阶段
+            if result["thinking_success"]:
+                try:
+                    logger.info(f"智能体 {speaker_name} 第{current_attempt}次尝试 - 发言阶段")
+                    speech = speaker.speak(context, previous_speeches)
+                    if speech and speech.get('content') and speech.get('content').strip():
+                        result["speech_result"] = speech
+                        result["speech_success"] = True
+                        logger.info(f"✅ 智能体 {speaker_name} 发言成功")
+                        break
+                    else:
+                        raise ValueError("发言内容为空")
+                except Exception as e:
+                    logger.warning(f"智能体 {speaker_name} 发言失败 (尝试 {current_attempt}): {e}")
+                    if current_attempt <= max_retries:
+                        import time
+                        time.sleep(current_attempt * 2)
+                        continue
+                    else:
+                        result["speech_result"] = {
+                            "agent_name": speaker_name,
+                            "role": speaker.role_definition,
+                            "content": f"{speaker_name}经过多次尝试后仍无法正常发言。",
+                            "timestamp": speaker._get_timestamp(),
+                            "is_fallback": True,
+                            "error": str(e)
+                        }
+                        result["error"] = str(e)
+        
+        # 确保有后备结果
+        if not result["thinking_success"] and not result["speech_success"]:
+            result["thinking_result"] = result["thinking_result"] or {
+                "raw_response": f"{speaker_name}的思考和发言过程完全失败。",
+                "is_fallback": True
+            }
+            result["speech_result"] = result["speech_result"] or {
+                "agent_name": speaker_name,
+                "role": speaker.role_definition,
+                "content": f"{speaker_name}由于系统错误无法参与本次讨论。",
+                "timestamp": speaker._get_timestamp(),
+                "is_fallback": True
+            }
+        
+        return result
+
+    def _generate_skeptic_response(
+        self,
+        target_expert: str,
+        expert_speech: str,
+        current_round: DiscussionRound,
+        revision_round: int = 1,
+    ):
+        """生成质疑者回应。revision_round=2 时为第二层：侧重实施参数/指标/数据查询并反馈给发言者。"""
         skeptic_name = f"skeptic_{target_expert}"
         skeptic = self.agents.get(skeptic_name)
 
@@ -2019,13 +2069,18 @@ class RoundtableDiscussion:
             # 发送质疑消息到消息总线
             self.message_bus.send_message(questioning_message)
 
+            # 讨论上下文：第二层时注入 revision_round/skeptic_layer 供质疑者做实施参数与数据反馈
+            context = self._get_discussion_context()
+            context["revision_round"] = revision_round
+            context["skeptic_layer"] = revision_round
+
             # 让质疑者处理消息并生成质疑内容
             question_result = skeptic.question_expert(
                 expert_opinion={
                     "content": expert_speech if isinstance(expert_speech, str) else expert_speech.get('content', ''),
                     "speaker": target_expert
                 },
-                context=self._get_discussion_context()
+                context=context,
             )
 
             # 提取质疑内容
@@ -2060,13 +2115,37 @@ class RoundtableDiscussion:
         return None
 
     def _get_discussion_context(self) -> Dict[str, Any]:
-        """获取讨论上下文"""
+        """获取讨论上下文（含 discussion_id 与 discussion/discussion_id/files 中的论文摘要，供质疑者网络检索与阅读本地论文）"""
+        local_papers_summary = ""
+        if self._ideation_papers:
+            lines = []
+            for i, p in enumerate(self._ideation_papers[:15], 1):
+                title = p.get("title", "")
+                authors = p.get("authors", [])
+                auth = ", ".join(authors[:3]) if isinstance(authors, list) else str(authors)
+                abstract = (p.get("abstract") or "")[:300]
+                year = p.get("year", "")
+                lines.append(f"[{i}] {title} | {auth} | {year}\n{abstract}")
+            local_papers_summary = "\n\n".join(lines)
+        # 论文 PDF 保存在 discussion/discussion_id/files（与 web_search_tool 下载路径一致）
+        local_pdf_dir = str(self.state_manager.storage_path / "files")
+        local_pdf_files = []
+        try:
+            if os.path.isdir(local_pdf_dir):
+                local_pdf_files = [f for f in os.listdir(local_pdf_dir) if f.lower().endswith(".pdf")]
+        except Exception:
+            pass
         return {
             "topic": self.discussion_topic,
             "rounds_completed": len(self.discussion_rounds),
             "current_participants": list(self.agents.keys()),
             "consensus_status": self.consensus_tracker.get_consensus_status(),
-            "recent_speeches": self._get_recent_speeches(10)
+            "recent_speeches": self._get_recent_speeches(10),
+            "discussion_id": self.discussion_id,
+            "local_papers_dir": local_pdf_dir,
+            "local_papers_summary": local_papers_summary,
+            "local_pdf_files": local_pdf_files,
+            "papers_downloaded_to": self._papers_downloaded_to or local_pdf_dir,
         }
 
     def _get_recent_speeches(self, limit: int) -> List[Dict[str, Any]]:
@@ -2907,614 +2986,3 @@ class RoundtableDiscussion:
                 "message": f"❌ 无法创建解决会话"
             }
 
-    def _conduct_depth_discussion_phase(self, current_round: DiscussionRound, round_number: int) -> Generator[Dict[str, Any], None, None]:
-        """
-        进行深度讨论阶段 - 专家间直接交互（增强版）
-
-        Args:
-            current_round: 当前轮次
-            round_number: 轮次编号
-
-        Yields:
-            深度讨论过程的各个步骤结果
-        """
-        logger.info(f"开始第{round_number}轮深度讨论阶段")
-        
-        # 获取当前交互模式和建议的模式切换
-        current_mode = self.interaction_mode_manager.current_mode
-        
-        # 构建上下文用于模式建议
-        mode_context = {
-            "divergence_count": len(self.consensus_tracker.divergence_points),
-            "consensus_level": self.consensus_tracker.get_consensus_level() if hasattr(self.consensus_tracker, 'get_consensus_level') else 0.0,
-            "expert_speech_count": len([s for s in current_round.speeches if s.get('role', '').startswith('expert')])
-        }
-        
-        # 检查是否需要切换模式
-        suggested_mode = self.interaction_mode_manager.suggest_mode_switch(mode_context)
-        if suggested_mode and suggested_mode != current_mode:
-            self.interaction_mode_manager.switch_mode(suggested_mode, f"基于讨论上下文自动切换")
-            current_mode = suggested_mode
-            
-            yield {
-                "step": "interaction_mode_switch",
-                "round": round_number,
-                "from_mode": self.interaction_mode_manager.mode_history[-1]["from_mode"] if self.interaction_mode_manager.mode_history else "structured",
-                "to_mode": current_mode.value,
-                "message": f"🔄 交互模式切换为: {self.interaction_mode_manager.get_mode_description(current_mode)}"
-            }
-
-        yield {
-            "step": "depth_discussion_start",
-            "round": round_number,
-            "message": f"🎯 开始第{round_number}轮深度讨论阶段 - 专家间直接交互",
-            "description": "专家们现在可以直接回应彼此的观点，进行更深入的讨论",
-            "interaction_mode": current_mode.value,
-            "allowed_interactions": self.interaction_mode_manager.get_allowed_interactions()
-        }
-        
-        # 更新自由讨论协调器的智能体引用
-        self.free_discussion_coordinator.set_agents(self.agents)
-
-        try:
-            # 获取所有专家智能体（排除主持人、协调者、综合者、质疑者等）
-            expert_agents = {
-                name: agent for name, agent in self.agents.items()
-                if not any(role in name.lower() for role in ['moderator', 'facilitator', 'synthesizer', 'data_analyst', 'risk_manager', 'scholar']) and
-                not name.startswith('skeptic_')
-            }
-
-            if not expert_agents:
-                logger.warning("没有找到专家智能体，跳过深度讨论阶段")
-                yield {
-                    "step": "depth_discussion_skip",
-                    "reason": "no_expert_agents",
-                    "message": "⚠️ 未找到专家智能体，跳过深度讨论阶段"
-                }
-                return
-
-            # 步骤1: 协调者发起深度讨论邀请
-            facilitator = self.agents.get("facilitator")
-            if facilitator:
-                invitation = facilitator.initiate_depth_discussion(
-                    expert_list=list(expert_agents.keys()),
-                    discussion_context=self._get_discussion_context(),
-                    previous_round=current_round
-                )
-
-                yield {
-                    "step": "depth_discussion_invitation",
-                    "content": invitation,
-                    "participants": list(expert_agents.keys())
-                }
-
-                # 保存邀请到轮次记录
-                current_round.add_speech("facilitator", invitation, "depth_discussion_invitation")
-
-            # 步骤2: 专家间直接交互
-            discussion_interactions = []
-            max_interactions = min(len(expert_agents) * 2, 10)  # 最多交互次数
-            interaction_count = 0
-            discussion_quality_score = 0.0
-
-            # 分析本轮发言，识别需要进一步讨论的观点
-            round_speeches = current_round.speeches
-            discussion_topics = self._identify_discussion_topics(round_speeches)
-
-            # 设置讨论调控参数
-            discussion_config = {
-                "max_duration_minutes": 5,  # 最大持续时间（分钟）
-                "min_interactions_per_topic": 2,  # 每个话题最少交互次数
-                "max_interactions_per_topic": 4,  # 每个话题最多交互次数
-                "quality_threshold": 0.6,  # 质量阈值
-                "moderation_interval": 3  # 每3次交互进行一次调控检查
-            }
-
-            start_time = datetime.now()
-
-            for topic_idx, topic in enumerate(discussion_topics[:3]):  # 最多讨论3个话题
-                yield {
-                    "step": "depth_discussion_topic",
-                    "topic_index": topic_idx + 1,
-                    "topic": topic,
-                    "message": f"📋 讨论话题 {topic_idx + 1}: {topic['description']}",
-                    "config": discussion_config
-                }
-
-                # 为每个话题进行专家间交互，包含调控逻辑
-                topic_interactions = self._conduct_topic_discussion_with_moderation(
-                    topic, expert_agents, round_number,
-                    discussion_config, start_time
-                )
-
-                topic_quality_scores = []
-                for interaction in topic_interactions:
-                    yield interaction
-                    discussion_interactions.append(interaction)
-                    interaction_count += 1
-
-                    # 评估交互质量
-                    quality_score = self._assess_interaction_quality(interaction)
-                    topic_quality_scores.append(quality_score)
-
-                    # 定期进行调控检查
-                    if interaction_count % discussion_config["moderation_interval"] == 0:
-                        moderation_action = self._check_discussion_moderation(
-                            discussion_interactions[-discussion_config["moderation_interval"]:],
-                            discussion_config
-                        )
-
-                        if moderation_action:
-                            yield moderation_action
-
-                    # 检查是否需要提前结束讨论
-                    elapsed_time = (datetime.now() - start_time).total_seconds() / 60
-                    if elapsed_time > discussion_config["max_duration_minutes"]:
-                        yield {
-                            "step": "depth_discussion_timeout",
-                            "message": f"⏰ 深度讨论已达到时间限制 ({discussion_config['max_duration_minutes']}分钟)，进入下一阶段",
-                            "elapsed_minutes": elapsed_time
-                        }
-                        break
-
-                    if interaction_count >= max_interactions:
-                        break
-
-                # 计算话题质量得分
-                if topic_quality_scores:
-                    topic_avg_quality = sum(topic_quality_scores) / len(topic_quality_scores)
-                    discussion_quality_score = max(discussion_quality_score, topic_avg_quality)
-
-                if interaction_count >= max_interactions:
-                    break
-
-            # 步骤2.5: 质量评估和调控总结
-            quality_assessment = self._assess_discussion_quality(
-                discussion_interactions, discussion_quality_score, discussion_config
-            )
-
-            if quality_assessment["needs_improvement"]:
-                yield {
-                    "step": "depth_discussion_quality_feedback",
-                    "assessment": quality_assessment,
-                    "message": "📊 深度讨论质量评估：发现需要改进的地方",
-                    "suggestions": quality_assessment["suggestions"]
-                }
-
-            # 步骤3: 深度讨论总结
-            if facilitator:
-                depth_summary = facilitator.summarize_depth_discussion(
-                    interactions=discussion_interactions,
-                    discussion_context=self._get_discussion_context()
-                )
-
-                current_round.add_speech("facilitator", depth_summary, "depth_discussion_summary")
-
-                yield {
-                    "step": "depth_discussion_summary",
-                    "content": depth_summary,
-                    "total_interactions": interaction_count
-                }
-
-            yield {
-                "step": "depth_discussion_complete",
-                "round": round_number,
-                "message": f"✅ 第{round_number}轮深度讨论阶段完成，共进行 {interaction_count} 次交互",
-                "interactions": interaction_count
-            }
-
-        except Exception as e:
-            logger.error(f"深度讨论阶段执行失败: {str(e)}", exc_info=True)
-            yield {
-                "step": "depth_discussion_error",
-                "error": str(e),
-                "message": f"⚠️ 深度讨论阶段出现错误: {str(e)}"
-            }
-
-    def _identify_discussion_topics(self, round_speeches: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """
-        从本轮发言中识别需要进一步讨论的话题
-
-        Args:
-            round_speeches: 本轮发言列表
-
-        Returns:
-            需要讨论的话题列表
-        """
-        topics = []
-
-        try:
-            # 分析发言内容，识别分歧点和需要澄清的观点
-            speech_contents = [speech.get('content', '') for speech in round_speeches
-                             if speech.get('type') == 'expert_opinion']
-
-            # 简单的启发式分析：寻找包含特定关键词的发言
-            discussion_keywords = [
-                '不同意', '反对', '质疑', '澄清', '进一步', '补充',
-                'disagree', 'oppose', 'question', 'clarify', 'further', 'additional'
-            ]
-
-            for i, content in enumerate(speech_contents):
-                speaker = round_speeches[i].get('speaker', f'专家{i+1}')
-
-                # 检查是否包含讨论关键词
-                if any(keyword in content.lower() for keyword in discussion_keywords):
-                    topics.append({
-                        "description": f"{speaker}的观点需要进一步讨论",
-                        "initiator": speaker,
-                        "content": content[:200] + "..." if len(content) > 200 else content,
-                        "reason": "包含讨论关键词"
-                    })
-
-            # 如果没有找到足够的话题，添加通用话题
-            if len(topics) < 2:
-                topics.append({
-                    "description": "专家们对解决方案的异同点",
-                    "initiator": "system",
-                    "content": "比较各专家提出的解决方案",
-                    "reason": "通用讨论话题"
-                })
-
-        except Exception as e:
-            logger.error(f"识别讨论话题失败: {str(e)}")
-            # 返回默认话题
-            topics = [{
-                "description": "各专家观点的综合讨论",
-                "initiator": "system",
-                "content": "讨论各专家的观点和建议",
-                "reason": "fallback_topic"
-            }]
-
-        return topics[:3]  # 最多返回3个话题
-
-    def _conduct_topic_discussion_with_moderation(self, topic: Dict[str, Any],
-                                                 expert_agents: Dict[str, 'BaseAgent'],
-                                                 round_number: int,
-                                                 config: Dict[str, Any],
-                                                 start_time: datetime) -> Generator[Dict[str, Any], None, None]:
-        """
-        带调控的专家间话题讨论
-
-        Args:
-            topic: 讨论话题
-            expert_agents: 专家智能体字典
-            round_number: 轮次编号
-            config: 讨论配置
-            start_time: 开始时间
-
-        Yields:
-            讨论交互结果
-        """
-        interaction_count = 0
-        conversation_id = str(uuid.uuid4())
-        topic_start_time = datetime.now()
-
-        try:
-            # 选择相关专家
-            relevant_experts = list(expert_agents.keys())[:min(4, len(expert_agents))]
-            active_participants = set()  # 跟踪活跃参与者
-
-            # 轮流让专家发言讨论这个话题
-            for i, expert_name in enumerate(relevant_experts):
-                if interaction_count >= config["max_interactions_per_topic"]:
-                    break
-
-                # 检查时间限制
-                elapsed_topic_time = (datetime.now() - topic_start_time).total_seconds() / 60
-                if elapsed_topic_time > config["max_duration_minutes"] / len(self._identify_discussion_topics([])):
-                    break
-
-                expert = expert_agents.get(expert_name)
-                if not expert:
-                    continue
-
-                try:
-                    # 生成专家对这个话题的深入讨论
-                    discussion_response = self._generate_expert_topic_discussion(
-                        expert, topic, round_number, conversation_id
-                    )
-
-                    if discussion_response and discussion_response.get('content'):
-                        active_participants.add(expert_name)
-                        interaction_count += 1
-
-                        yield {
-                            "step": "depth_discussion_interaction",
-                            "speaker": expert_name,
-                            "topic": topic['description'],
-                            "content": discussion_response['content'],
-                            "interaction_type": "topic_discussion",
-                            "conversation_id": conversation_id,
-                            "interaction_number": interaction_count
-                        }
-
-                        # 如果不是最后一个专家，让下一个专家回应
-                        if i < len(relevant_experts) - 1 and interaction_count < config["max_interactions_per_topic"]:
-                            next_expert_name = relevant_experts[i + 1]
-                            next_expert = expert_agents.get(next_expert_name)
-
-                            if next_expert:
-                                response_discussion = self._generate_expert_response_discussion(
-                                    next_expert, expert_name, discussion_response['content'],
-                                    topic, round_number, conversation_id
-                                )
-
-                                if response_discussion and response_discussion.get('content'):
-                                    active_participants.add(next_expert_name)
-                                    interaction_count += 1
-
-                                    yield {
-                                        "step": "depth_discussion_interaction",
-                                        "speaker": next_expert_name,
-                                        "responding_to": expert_name,
-                                        "topic": topic['description'],
-                                        "content": response_discussion['content'],
-                                        "interaction_type": "peer_response",
-                                        "conversation_id": conversation_id,
-                                        "interaction_number": interaction_count
-                                    }
-
-                except Exception as e:
-                    logger.error(f"专家 {expert_name} 深度讨论失败: {str(e)}")
-                    continue
-
-            # 检查参与度
-            participation_rate = len(active_participants) / len(relevant_experts) if relevant_experts else 0
-            if participation_rate < 0.5:  # 少于50%专家参与
-                yield {
-                    "step": "depth_discussion_participation_warning",
-                    "message": f"⚠️ 话题 '{topic['description']}' 参与度较低 ({participation_rate:.1%})",
-                    "active_participants": list(active_participants),
-                    "total_invited": len(relevant_experts)
-                }
-
-        except Exception as e:
-            logger.error(f"带调控的话题讨论执行失败: {str(e)}")
-
-    def _generate_expert_topic_discussion(self, expert: 'BaseAgent', topic: Dict[str, Any],
-                                        round_number: int, conversation_id: str) -> Optional[Dict[str, Any]]:
-        """
-        生成专家对特定话题的深入讨论
-
-        Args:
-            expert: 专家智能体
-            topic: 讨论话题
-            round_number: 轮次编号
-            conversation_id: 对话ID
-
-        Returns:
-            讨论内容
-        """
-        try:
-            discussion_prompt = f"""作为{expert.role_definition}，请对以下话题进行深入讨论：
-
-话题：{topic['description']}
-
-相关内容：{topic.get('content', '无具体内容')}
-
-请从您的专业角度出发，提供：
-1. 对这个话题的分析和观点
-2. 与其他专家观点的比较或回应
-3. 可能的解决方案或建议
-
-请保持建设性和专业性。"""
-
-            # 使用专家的LLM进行推理
-            response = expert.llm.invoke(discussion_prompt)
-            content = response.content if hasattr(response, 'content') else str(response)
-
-            return {
-                "content": content,
-                "topic": topic['description'],
-                "expert": expert.name,
-                "timestamp": datetime.now().isoformat()
-            }
-
-        except Exception as e:
-            logger.error(f"生成专家话题讨论失败 ({expert.name}): {str(e)}")
-            return None
-
-    def _generate_expert_response_discussion(self, expert: 'BaseAgent', target_expert: str,
-                                           original_content: str, topic: Dict[str, Any],
-                                           round_number: int, conversation_id: str) -> Optional[Dict[str, Any]]:
-        """
-        生成专家对其他专家观点的回应讨论
-
-        Args:
-            expert: 回应专家
-            target_expert: 被回应的专家
-            original_content: 原始讨论内容
-            topic: 讨论话题
-            round_number: 轮次编号
-            conversation_id: 对话ID
-
-        Returns:
-            回应内容
-        """
-        try:
-            response_prompt = f"""作为{expert.role_definition}，请回应{target_expert}的观点：
-
-话题：{topic['description']}
-
-{target_expert}的观点：
-{original_content[:500]}...
-
-请从您的专业角度出发：
-1. 表达您对这个观点的理解
-2. 指出同意或不同意的部分
-3. 提供补充意见或建议
-4. 寻求可能的共识点
-
-请保持建设性和专业性。"""
-
-            # 使用专家的LLM进行推理
-            response = expert.llm.invoke(response_prompt)
-            content = response.content if hasattr(response, 'content') else str(response)
-
-            return {
-                "content": content,
-                "responding_to": target_expert,
-                "topic": topic['description'],
-                "expert": expert.name,
-                "timestamp": datetime.now().isoformat()
-            }
-
-        except Exception as e:
-            logger.error(f"生成专家回应讨论失败 ({expert.name}): {str(e)}")
-            return None
-
-    def _assess_interaction_quality(self, interaction: Dict[str, Any]) -> float:
-        """
-        评估交互质量
-
-        Args:
-            interaction: 交互记录
-
-        Returns:
-            质量得分 (0.0-1.0)
-        """
-        try:
-            content = interaction.get('content', '')
-            if not content or len(content.strip()) < 50:
-                return 0.3  # 内容太短
-
-            # 简单的质量评估指标
-            quality_indicators = [
-                len(content) > 200,  # 有足够长度
-                any(keyword in content.lower() for keyword in ['分析', '建议', '观点', '经验', '同意', '不同意']),  # 包含专业术语
-                '?' in content or '？' in content,  # 包含问题
-                any(word in content.lower() for word in ['因此', '所以', '因为', '由于', '根据']),  # 包含逻辑连接词
-            ]
-
-            quality_score = sum(quality_indicators) / len(quality_indicators)
-            return min(1.0, quality_score + 0.2)  # 基础分数加成
-
-        except Exception as e:
-            logger.error(f"评估交互质量失败: {str(e)}")
-            return 0.5  # 默认中等质量
-
-    def _check_discussion_moderation(self, recent_interactions: List[Dict[str, Any]],
-                                   config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """
-        检查讨论是否需要调控
-
-        Args:
-            recent_interactions: 最近的交互记录
-            config: 讨论配置
-
-        Returns:
-            调控行动（如果需要）
-        """
-        try:
-            if not recent_interactions:
-                return None
-
-            # 检查是否重复内容过多
-            contents = [interaction.get('content', '') for interaction in recent_interactions]
-            unique_contents = set(content[:100] for content in contents if content)  # 取前100字符比较
-
-            if len(unique_contents) < len(recent_interactions) * 0.6:  # 重复率过高
-                return {
-                    "step": "depth_discussion_moderation",
-                    "action": "redirect_topic",
-                    "message": "🔄 检测到讨论内容重复，建议转向新的讨论角度",
-                    "reason": "content_repetition",
-                    "suggestion": "请专家们从不同角度重新审视这个问题"
-                }
-
-            # 检查是否偏离主题
-            topic_keywords = []
-            for interaction in recent_interactions:
-                topic = interaction.get('topic', '')
-                # 提取关键词（简单实现）
-                words = [word for word in topic.split() if len(word) > 1]
-                topic_keywords.extend(words)
-
-            off_topic_count = 0
-            for interaction in recent_interactions:
-                content = interaction.get('content', '').lower()
-                topic_relevance = sum(1 for keyword in topic_keywords if keyword.lower() in content)
-                if topic_relevance < len(topic_keywords) * 0.3:  # 相关性太低
-                    off_topic_count += 1
-
-            if off_topic_count > len(recent_interactions) * 0.5:  # 超过一半偏离主题
-                return {
-                    "step": "depth_discussion_moderation",
-                    "action": "refocus_topic",
-                    "message": "🎯 讨论似乎偏离了主题，建议回到核心问题",
-                    "reason": "off_topic",
-                    "suggestion": "请重新聚焦于原始话题"
-                }
-
-            return None
-
-        except Exception as e:
-            logger.error(f"检查讨论调控失败: {str(e)}")
-            return None
-
-    def _assess_discussion_quality(self, interactions: List[Dict[str, Any]],
-                                 overall_quality: float, config: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        评估整个深度讨论阶段的质量
-
-        Args:
-            interactions: 所有交互记录
-            overall_quality: 整体质量得分
-            config: 讨论配置
-
-        Returns:
-            质量评估结果
-        """
-        try:
-            assessment = {
-                "overall_quality_score": overall_quality,
-                "total_interactions": len(interactions),
-                "needs_improvement": False,
-                "strengths": [],
-                "weaknesses": [],
-                "suggestions": []
-            }
-
-            # 评估交互数量
-            if len(interactions) < config.get("min_interactions_per_topic", 2) * 2:
-                assessment["weaknesses"].append("交互次数不足")
-                assessment["suggestions"].append("增加专家间的直接交流")
-                assessment["needs_improvement"] = True
-
-            # 评估质量得分
-            if overall_quality < config["quality_threshold"]:
-                assessment["weaknesses"].append("讨论质量有待提高")
-                assessment["suggestions"].append("鼓励更深入的专业分析和建设性意见")
-                assessment["needs_improvement"] = True
-            else:
-                assessment["strengths"].append("讨论质量良好")
-
-            # 评估参与度
-            speakers = set(interaction.get('speaker', '') for interaction in interactions)
-            if len(speakers) < 3:  # 至少需要3个不同专家参与
-                assessment["weaknesses"].append("参与专家数量不足")
-                assessment["suggestions"].append("鼓励更多专家参与讨论")
-                assessment["needs_improvement"] = True
-            else:
-                assessment["strengths"].append("参与度良好")
-
-            # 评估交互多样性
-            interaction_types = set(interaction.get('interaction_type', '') for interaction in interactions)
-            if len(interaction_types) > 1:
-                assessment["strengths"].append("交互形式多样")
-            else:
-                assessment["weaknesses"].append("交互形式较为单一")
-                assessment["suggestions"].append("尝试不同类型的交流方式")
-
-            return assessment
-
-        except Exception as e:
-            logger.error(f"评估讨论质量失败: {str(e)}")
-            return {
-                "overall_quality_score": 0.5,
-                "total_interactions": len(interactions),
-                "needs_improvement": True,
-                "strengths": [],
-                "weaknesses": ["评估过程出错"],
-                "suggestions": ["需要人工检查讨论质量"]
-            }

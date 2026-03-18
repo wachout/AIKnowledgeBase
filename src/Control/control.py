@@ -3,7 +3,7 @@
 '''
 Created on 2025年9月10日
 
-@author: 
+@author: wangchao
 '''
 
 import os
@@ -156,7 +156,10 @@ class CControl():
     def file_path_analysis(self, knowledge_id, user_id, user_name, file_id, file_path, permission_level, _url=""):
         
         # 根据文件类型选择解析方式
+        logger.info(f"文件路径: {file_path}")
         file_extension = os.path.splitext(file_path)[1].lower()
+        logger.info(f"文件类型: {file_extension}")
+
         is_pdf = file_extension == ".pdf"
         is_text_file = file_extension in [".md", ".txt"]
         
@@ -167,22 +170,32 @@ class CControl():
             if _txt is None:
                 logger.error(f"文本文件读取失败: {file_path}")
                 return {"error_code": 1, "error_msg": "文本文件读取失败"}
-        elif is_pdf and not is_pdf_advanced_enabled():
+        elif is_pdf:
+            if(not is_pdf_advanced_enabled()):
             # PDF_FLAG=False: 使用初级PDF解析
-            logger.info(f"使用初级PDF解析: {file_path}")
-            _, content_list = self.file_obj.read_pdf_basic(file_path)
-            if content_list is None:
-                logger.error(f"初级PDF解析失败: {file_path}")
-                return {"error_code": 1, "error_msg": "PDF解析失败，请检查是否安装了PyMuPDF或PyPDF2"}
-            _txt = content_list  # 初级解析直接返回文本内容
-        else:
-            # PDF_FLAG=True 或其他文件类型: 使用高级解析（调用API）
-            logger.info(f"使用高级文件解析: {file_path}")
-            _, content_list = self.file_obj.read_stream_file(file_path)
-            if content_list is None:
-                logger.error(f"高级文件解析失败: {file_path}")
-                return {"error_code": 1, "error_msg": "文件解析失败"}
-            _txt = self.content_list_to_json(content_list, file_id="")
+                logger.info(f"使用初级PDF解析: {file_path}")
+                _, content_list = self.file_obj.read_pdf_basic(file_path)
+                if content_list is None:
+                    logger.error(f"初级PDF解析失败: {file_path}")
+                    return {"error_code": 1, "error_msg": "PDF解析失败，请检查是否安装了PyMuPDF或PyPDF2"}
+                _txt = content_list  # 初级解析直接返回文本内容
+            else:
+                # PDF_FLAG=True 或其他文件类型: 使用高级解析（调用API）
+                logger.info(f"使用高级文件解析: {file_path}")
+                _, content_list = self.file_obj.read_stream_file(file_path)
+                if content_list is None:
+                    logger.error(f"高级文件解析失败: {file_path}")
+                    return {"error_code": 1, "error_msg": "文件解析失败"}
+                _txt = self.content_list_to_json(content_list, file_id="")
+        elif file_extension == ".csv":
+            logger.info(f"使用CSV解析: {file_path}")
+            csv_result = self.file_obj.read_csv(file_path)
+            _txt = csv_result.get("catalog_text", "")
+        elif file_extension == ".xlsx":
+            logger.info(f"使用XLSX解析: {file_path}")
+            split_result = self.file_obj.split_excel_to_csv(file_path)
+            _txt = split_result.get("catalog_text", "")
+
         file_name = os.path.basename(file_path)
         txt, _ = os.path.splitext(file_name)
         file_md_path = file_path.replace(file_name, txt + ".md")
@@ -218,7 +231,8 @@ class CControl():
                             "create_time":"", "catalog":toc_json}
 
         cSingleSqlite.insert_file_detail_info(detail_info_dict)
-
+        logger.info(f"RAG 文件信息: {_txt}")
+        logger.info(f"文件内容: {_dict}")
         # 保存 Markdown 内容到 Elasticsearch
         # from Config.elasticsearch_config import is_elasticsearch_enabled
         if is_elasticsearch_enabled():

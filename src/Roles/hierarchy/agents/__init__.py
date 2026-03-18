@@ -20,13 +20,6 @@ from .implementation_agents import (
     DocumenterAgent,
     CoordinatorAgent
 )
-from .validation_agents import (
-    QualityInspectorAgent,
-    LogicValidatorAgent,
-    PerformanceAnalystAgent,
-    SecurityAuditorAgent,
-    ComplianceCheckerAgent
-)
 
 # 新增：动态智能体相关
 from .scholar_agent import ScholarAgent
@@ -43,21 +36,15 @@ __all__ = [
     'StrategistAgent',
     'AnalystAgent',
     'CriticAgent',
-    # 实施层智能体（旧）
+    # 实施层智能体
     'ArchitectAgent',
     'DeveloperAgent',
     'TesterAgent',
     'DocumenterAgent',
     'CoordinatorAgent',
-    # 实施层智能体（新 - 动态专家模式）
+    # 动态专家模式智能体
     'ScholarAgent',
     'DynamicExpertAgent',
     'DynamicAgentFactory',
     'SynthesizerAgent',
-    # 检验层智能体（旧）
-    'QualityInspectorAgent',
-    'LogicValidatorAgent',
-    'PerformanceAnalystAgent',
-    'SecurityAuditorAgent',
-    'ComplianceCheckerAgent',
 ]
